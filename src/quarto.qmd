@@ -127,7 +127,7 @@ plot_B <- DimPlot(integrated_obj,
 
 ggsave(plot = plot_A, filename = here("output/umap_by_condition.pdf"), height = 8, width = 10)
 
-ggsave(plot = plot_B, filename = here("output/umap_by_condition_split.pdf", height = 8, width = 10))
+ggsave(plot = plot_B, filename = here("output/umap_by_condition_split.pdf"), height = 8, width = 10)
 ```
 
 
