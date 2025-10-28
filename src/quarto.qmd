@@ -97,3 +97,38 @@ integrated_obj[["cluster_id"]] <- Idents(object = integrated_obj)
 saveRDS(integrated_obj, file = here("data/processed/integrated_seurat.rds"))
 ```
 
+```{r}
+condition_colors <- c("NS" = "#808080",      
+                           "BP_Control" = "#0072B2", 
+                           "BP_Cues" = "#D55E00") 
+condition_order <- c("NS", "BP_Control", "BP_Cues")
+
+integrated_obj$condition <- factor(integrated_obj$condition, levels = condition_order)
+
+plot_A <- DimPlot(integrated_obj, 
+                  reduction = "umap", 
+                  group.by = "condition",
+                  cols = condition_colors,
+                  label = FALSE) + 
+  ggtitle("A. Integrated UMAP (Colored by Condition)") +
+  theme(plot.title = element_text(face = "bold", size = 14))
+
+plot_B <- DimPlot(integrated_obj, 
+                  reduction = "umap", 
+                  group.by = "condition",
+                  cols = condition_colors, 
+                  split.by = "condition",
+                  label = FALSE) +
+  ggtitle("B. UMAP Split by Condition (Visualizing Structure)") +
+  theme(plot.title = element_text(face = "bold", size = 14))
+
+
+
+
+ggsave(plot = plot_A, filename = here("output/umap_by_condition.pdf"), height = 8, width = 10)
+
+ggsave(plot = plot_B, filename = here("output/umap_by_condition_split.pdf", height = 8, width = 10))
+```
+
+
+
