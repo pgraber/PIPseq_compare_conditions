@@ -1,0 +1,99 @@
+---
+title: "compare_conditions"
+toc: true
+format:
+  html:
+    code-fold: false
+    code-tools: true
+    self-contained: true
+    number-sections: true
+    theme: flatly
+    lightbox: true
+execute: 
+  output: false
+  error: false
+  warning: false
+  echo: false
+project:
+  execute-dir: journal
+---
+
+```{r, setup, include=FALSE}
+library(knitr)
+library(here)
+library(Seurat)
+library(ggVennDiagram)
+library(ggplot2)
+library(tidyverse)
+library(ggpubr)
+library(viridis)
+library(patchwork)
+library(svglite)
+library(glmGamPoi)
+
+opts_knit$set(root.dir = here())
+```
+
+```{r}
+seurat_neurospheres <- readRDS(here("data/seurat_neurospheres.rds"))
+seurat_bioinert <- readRDS(here("data/seurat_bioinert.rds"))
+seurat_biofunctional <- readRDS(here("data/seurat_biofunctional.rds"))
+```
+
+```{r}
+# 1. Create a list of your three Seurat objects
+# This is the starting point for anchor-based integration
+obj_list <- list(
+  seurat_neurospheres,
+  seurat_bioinert,
+  seurat_biofunctional
+)
+
+names(obj_list) <- c("NS", "BP_Control", "BP_Cues")
+
+for (i in 1:length(obj_list)) {
+  obj_list[[i]]$condition <- names(obj_list)[i]
+}
+
+obj_list <- lapply(X = obj_list, FUN = function(x) {
+  SCTransform(x, vst.flavor = "v2", verbose = FALSE, conserve.memory = TRUE) %>%
+  RunPCA(npcs = 30, verbose = FALSE)
+})
+
+features <- SelectIntegrationFeatures(object.list = obj_list, nfeatures = 2000)
+```
+
+```{r}
+# 1. Prepare data for SCT integration
+obj_list <- PrepSCTIntegration(object.list = obj_list, anchor.features = features)
+
+# 2. Find the integration anchors
+anchors <- FindIntegrationAnchors(
+  object.list = obj_list,
+  normalization.method = "SCT",
+  anchor.features = features
+)
+
+# 3. Integrate the data into a single object
+# The resulting object is named 'integrated_obj' and contains the batch-corrected 'integrated' assay.
+integrated_obj <- IntegrateData(anchorset = anchors, normalization.method = "SCT")
+```
+
+```{r}
+# 1. Set the default assay to 'integrated'
+DefaultAssay(integrated_obj) <- "integrated"
+
+# 2. Run PCA, Clustering, and UMAP on the integrated data
+integrated_obj <- RunPCA(integrated_obj, npcs = 30, verbose = FALSE)
+integrated_obj <- FindNeighbors(integrated_obj, dims = 1:30, verbose = FALSE)
+integrated_obj <- FindClusters(integrated_obj, resolution = 0.6, verbose = FALSE)
+integrated_obj <- RunUMAP(integrated_obj, dims = 1:30, verbose = FALSE)
+
+# 3. Store cluster IDs for analysis
+integrated_obj[["cluster_id"]] <- Idents(object = integrated_obj)
+```
+
+```{r}
+saveRDS(integrated_obj, file = here("data/processed/integrated_seurat.rds"))
+```
+
