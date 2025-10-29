@@ -30,6 +30,7 @@ library(viridis)
 library(patchwork)
 library(svglite)
 library(glmGamPoi)
+library(RColorBrewer)
 
 opts_knit$set(root.dir = here())
 ```
@@ -130,5 +131,236 @@ ggsave(plot = plot_A, filename = here("output/umap_by_condition.pdf"), height = 
 ggsave(plot = plot_B, filename = here("output/umap_by_condition_split.pdf"), height = 8, width = 10)
 ```
 
+```{r}
+
+n_clusters <- length(unique(integrated_obj$seurat_clusters))
+
+base_colors <- c(brewer.pal(n = 12, name = "Set3"), 
+                 brewer.pal(n = 12, name = "Paired"))
+
+cluster_colors <- colorRampPalette(base_colors)(n_clusters)
+
+umap_clusters <- DimPlot(integrated_obj, 
+                  reduction = "umap", 
+                  group.by = "seurat_clusters",
+                  cols = cluster_colors,
+                  label = TRUE, 
+                  repel = TRUE) + 
+  ggtitle("Figure 2. Integrated UMAP (Colored by Cluster ID)") +
+  theme(plot.title = element_text(face = "bold", size = 14),
+        legend.position = "right") 
+
+ggsave(umap_clusters, filename = here("output/umap_by_cluster.pdf"), height = 8, width = 10)
+
+```
+
+```{r}
+DefaultAssay(integrated_obj) <- "integrated"
+
+all_cluster_markers <- FindAllMarkers(
+  object = integrated_obj, 
+  only.pos = TRUE,         
+  min.pct = 0.1,           
+  logfc.threshold = 0.25,
+  assay = "integrated"
+)
+
+top3_markers <- all_cluster_markers %>%
+  group_by(cluster) %>%
+  slice_max(n = 3, order_by = avg_log2FC)
+
+genes_to_plot <- unique(top3_markers$gene)
+
+DefaultAssay(integrated_obj) <- "RNA"
+
+cluster_markers_umap <- DotPlot(integrated_obj, 
+                  features = genes_to_plot, 
+                  cols = c("lightgrey", "#D55E00"),
+                  dot.scale = 8) + 
+  RotatedAxis() +
+  ggtitle("Figure 3. Top Marker Gene Expression Across Cell Clusters") +
+  theme(plot.title = element_text(face = "bold", size = 14),
+        axis.text.x = element_text(angle = 45, hjust = 1, size = 10))
+
+ggsave(plot_D, filename = here("output/cluster_markers_umap.pdf"), height = 8, width = 12)
+
+```
+
+## Label Transfer
+
+```{r}
+
+integrated_obj <- readRDS(here("data/processed/integrated_seurat.rds"))
 
 
+reference_matrix_path <- here("data/raw/Filbin_GSE184357/counts_fresh_postFilter.txt") 
+reference_metadata_path <- here("data/raw/Filbin_GSE184357/metadata_fresh_postFilter.txt") 
+
+
+dims <- 30
+prediction_score_threshold <- 0.5 
+annotation_column <- "annotation" ),
+filter_values <- c("G2M", "S") 
+umap_width <- 12 
+umap_height <- 10 
+
+
+reference_seurat_obj_output <- here("output/filbin_reference_seurat_obj.rds")
+labeled_seurat_obj_output <- here("output/labeled_integrated_obj.rds") 
+label_plot_output <- here("output/label_plot_raw.pdf")
+score_plot_output <- here("output/score_plot.pdf")
+violin_plot_output <- here("output/violin_plot.pdf")
+confident_plot_output <- here("output/confident_plot.pdf")
+
+
+
+custom_palette <- c(
+    "AC-like" = "#3CB371", 
+    "MES-like" = "#1E90FF", 
+    "OPC-like" = "#FF6347", 
+    "Uncertain" = "#808080" 
+)
+
+reference_matrix <- read.table(reference_matrix_path,
+    header = TRUE, sep = "\t", row.names = 1
+)
+reference_metadata <- read.table(reference_metadata_path,
+    header = TRUE, sep = "\t", row.names = 1
+)
+
+
+reference <- CreateSeuratObject(counts = reference_matrix)
+reference <- AddMetaData(reference, metadata = reference_metadata)
+
+
+if (length(filter_values) > 0) {
+    
+    cells_to_keep_anno <- !(reference@meta.data[[annotation_column]] %in%
+        filter_values)
+    
+    print(paste("Original reference cell count:", ncol(reference)))
+    print(paste("Filtered out", sum(!cells_to_keep_anno), "cells based on '", annotation_column, "' (including G2M/S)."))
+    
+    reference <- subset(reference,
+        cells = rownames(reference@meta.data)[cells_to_keep_anno]
+    )
+    print(paste("New reference cell count:", ncol(reference)))
+}
+
+
+shared_genes <- intersect(rownames(reference), rownames(integrated_obj))
+
+-
+reference <- SCTransform(reference, verbose = FALSE)
+
+
+reference <- RunPCA(reference, verbose = FALSE, features = shared_genes)
+
+
+saveRDS(reference, reference_seurat_obj_output)
+
+
+anchors <- FindTransferAnchors(
+    reference = reference,
+    query = integrated_obj, 
+    dims = 1:dims,
+    features = shared_genes,
+    normalization.method = "SCT"
+)
+
+predicted_labels <- TransferData(
+    anchorset = anchors,
+    refdata = reference@meta.data[[annotation_column]], 
+    dims = 1:dims
+)
+
+
+integrated_obj$transfered_labels <- predicted_labels$predicted.id
+integrated_obj$transfered_label_score <- predicted_labels$prediction.score.max
+
+# Combine all OPC-like cells into one category for simplicity
+#integrated_obj$transfered_labels <- ifelse(
+   # grepl("OPC-like", integrated_obj$transfered_labels),
+   # "OPC-like",
+   # integrated_obj$transfered_labels
+#)
+
+
+if (!is.null(prediction_score_threshold) && prediction_score_threshold != "null") {
+    integrated_obj$transfered_labels_confident <- ifelse(
+        integrated_obj$transfered_label_score > as.numeric(prediction_score_threshold),
+        integrated_obj$transfered_labels,
+        "Uncertain"
+    )
+
+
+    integrated_obj$transfered_labels_confident <- ifelse(
+        grepl("OPC-like", integrated_obj$transfered_labels_confident),
+        "OPC-like",
+        integrated_obj$transfered_labels_confident
+    )
+}
+
+
+p1 <- DimPlot(integrated_obj,
+    group.by = "transfered_labels",
+    label = FALSE,
+    cols = custom_palette 
+) +
+    ggtitle("Transferred Labels (Raw)") +
+    theme(
+        axis.title = element_text(size = 12),
+        axis.text = element_text(size = 10),
+        legend.text = element_text(size = 10)
+    )
+
+p2 <- FeaturePlot(integrated_obj,
+    features = "transfered_label_score"
+) +
+    ggtitle("Prediction Score") +
+    theme(
+        axis.title = element_text(size = 12),
+        axis.text = element_text(size = 10),
+        legend.text = element_text(size = 10)
+    )
+
+p3 <- VlnPlot(integrated_obj,
+    features = "transfered_label_score",
+    group.by = "transfered_labels",
+    cols = custom_palette 
+) +
+    ggtitle("Prediction Score by Label") +
+    theme(
+        axis.title = element_text(size = 12),
+        axis.text = element_text(size = 10),
+        legend.text = element_text(size = 10),
+        axis.text.x = element_text(angle = 45, hjust = 1)
+    )
+
+
+
+
+ggsave(label_plot_output, p1, width = umap_width, height = umap_height)
+ggsave(score_plot_output, p2, width = umap_width, height = umap_height)
+ggsave(violin_plot_output, p3, width = umap_width, height = umap_height)
+
+
+if (!is.null(prediction_score_threshold) && prediction_score_threshold != "null") {
+    p4 <- DimPlot(integrated_obj, 
+        group.by = "transfered_labels_confident", 
+        label = FALSE,
+        cols = custom_palette 
+    ) +
+        ggtitle("Figure 4. Confident Subtype Annotations (Filbin)") +
+        theme(
+            axis.title = element_text(size = 12),
+            axis.text = element_text(size = 10),
+            legend.text = element_text(size = 10)
+        )
+    ggsave(confident_plot_output, p4, width = umap_width, height = umap_height)
+    print(p4) 
+} else {
+    print("Skipping Confident Plot: prediction_score_threshold set to null.")
+}
+
+```
