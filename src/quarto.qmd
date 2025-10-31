@@ -31,6 +31,12 @@ library(patchwork)
 library(svglite)
 library(glmGamPoi)
 library(RColorBrewer)
+library(readxl)
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(cowplot)
+library(purrr)
+library(cowplot)
 
 opts_knit$set(root.dir = here())
 ```
@@ -186,24 +192,61 @@ ggsave(plot_D, filename = here("output/cluster_markers_umap.pdf"), height = 8, w
 
 ```
 
+```{r}
+markers_filtered <- all_cluster_markers %>%
+  filter(p_val_adj < 0.05, avg_log2FC > 0.25)
+
+top_markers <- markers_filtered %>%
+  group_by(cluster) %>%
+  slice_max(order_by = avg_log2FC, n = 50)
+
+# convert gene symbols to Entrez IDs
+cluster_list <- split(top_markers$gene, top_markers$cluster)
+
+enrich_results <- lapply(names(cluster_list), function(clust) {
+  genes <- cluster_list[[clust]]
+  genes_entrez <- bitr(genes, fromType = "SYMBOL", toType = "ENTREZID", OrgDb = org.Hs.eg.db)
+  
+  ego <- enrichGO(
+    gene         = genes_entrez$ENTREZID,
+    OrgDb        = org.Hs.eg.db,
+    ont          = "BP",
+    readable     = TRUE,
+    pAdjustMethod = "BH",
+    qvalueCutoff = 0.05
+  )
+  ego@result$Cluster <- clust
+  return(ego@result)
+})
+
+# combine into one dataframe
+enrich_df <- do.call(rbind, enrich_results)
+
+```
+
+```{r}
+enrich_df <- enrich_df %>% filter(!is.na(p.adjust))
+
+# top 3 terms per cluster by smallest adjusted p-value
+top_terms <- enrich_df %>%
+  group_by(Cluster) %>%
+  slice_min(order_by = p.adjust, n = 3, with_ties = FALSE) %>%
+  ungroup() %>%
+  dplyr::select(Cluster, Description, p.adjust, GeneRatio, Count)
+
+top_terms
+
+```
+
+
+
 ## Label Transfer
 
 ```{r}
-
-integrated_obj <- readRDS(here("data/processed/integrated_seurat.rds"))
-
-
-reference_matrix_path <- here("data/raw/Filbin_GSE184357/counts_fresh_postFilter.txt") 
-reference_metadata_path <- here("data/raw/Filbin_GSE184357/metadata_fresh_postFilter.txt") 
-
-
-dims <- 30
-prediction_score_threshold <- 0.5 
-annotation_column <- "annotation" ),
-filter_values <- c("G2M", "S") 
-umap_width <- 12 
-umap_height <- 10 
-
+# --- File paths ---
+integrated_obj_path <- here("data/processed/integrated_seurat.rds")
+reference_matrix_path <- here("data/Filbin_GSE184357/counts_fresh_postFilter.txt") 
+reference_metadata_path <- here("data/Filbin_GSE184357/metadata_fresh_postFilter.txt") 
 
 reference_seurat_obj_output <- here("output/filbin_reference_seurat_obj.rds")
 labeled_seurat_obj_output <- here("output/labeled_integrated_obj.rds") 
@@ -212,54 +255,52 @@ score_plot_output <- here("output/score_plot.pdf")
 violin_plot_output <- here("output/violin_plot.pdf")
 confident_plot_output <- here("output/confident_plot.pdf")
 
+# --- Parameters ---
+dims <- 30
+prediction_score_threshold <- 0.7
+annotation_column <- "annotation"
+filter_values <- c("G2M", "S") 
+umap_width <- 12 
+umap_height <- 10 
 
-
+# --- Custom color palette for all labels ---
 custom_palette <- c(
-    "AC-like" = "#3CB371", 
-    "MES-like" = "#1E90FF", 
-    "OPC-like" = "#FF6347", 
-    "Uncertain" = "#808080" 
+    "AC-like"     = "#1b9e77",  # dark teal
+    "MES-like"    = "#d95f02",  # burnt orange
+    "Microglia"   = "#7570b3",  # purple
+    "OC-like"     = "#e7298a",  # pink
+    "OPC-like-1"  = "#66a61e",  # green
+    "OPC-like-2"  = "#e6ab02",  # yellow-orange
+    "OPC-like-3"  = "#a6761d"   # brown
 )
 
-reference_matrix <- read.table(reference_matrix_path,
-    header = TRUE, sep = "\t", row.names = 1
-)
-reference_metadata <- read.table(reference_metadata_path,
-    header = TRUE, sep = "\t", row.names = 1
-)
+# --- Load Seurat object ---
+integrated_obj <- readRDS(integrated_obj_path)
 
+# --- Load reference ---
+reference_matrix <- read.table(reference_matrix_path, header = TRUE, sep = "\t", row.names = 1)
+reference_metadata <- read.table(reference_metadata_path, header = TRUE, sep = "\t", row.names = 1)
 
 reference <- CreateSeuratObject(counts = reference_matrix)
 reference <- AddMetaData(reference, metadata = reference_metadata)
 
-
+# --- Filter reference cells ---
 if (length(filter_values) > 0) {
-    
-    cells_to_keep_anno <- !(reference@meta.data[[annotation_column]] %in%
-        filter_values)
-    
-    print(paste("Original reference cell count:", ncol(reference)))
-    print(paste("Filtered out", sum(!cells_to_keep_anno), "cells based on '", annotation_column, "' (including G2M/S)."))
-    
-    reference <- subset(reference,
-        cells = rownames(reference@meta.data)[cells_to_keep_anno]
-    )
-    print(paste("New reference cell count:", ncol(reference)))
+    cells_to_keep_anno <- !(reference@meta.data[[annotation_column]] %in% filter_values)
+    reference <- subset(reference, cells = rownames(reference@meta.data)[cells_to_keep_anno])
 }
 
-
+# --- Shared genes ---
 shared_genes <- intersect(rownames(reference), rownames(integrated_obj))
 
--
+# --- SCTransform + PCA ---
 reference <- SCTransform(reference, verbose = FALSE)
-
-
 reference <- RunPCA(reference, verbose = FALSE, features = shared_genes)
 
-
+# --- Save reference object ---
 saveRDS(reference, reference_seurat_obj_output)
 
-
+# --- Transfer anchors & labels ---
 anchors <- FindTransferAnchors(
     reference = reference,
     query = integrated_obj, 
@@ -274,62 +315,54 @@ predicted_labels <- TransferData(
     dims = 1:dims
 )
 
-
 integrated_obj$transfered_labels <- predicted_labels$predicted.id
 integrated_obj$transfered_label_score <- predicted_labels$prediction.score.max
 
-# Combine all OPC-like cells into one category for simplicity
-#integrated_obj$transfered_labels <- ifelse(
-   # grepl("OPC-like", integrated_obj$transfered_labels),
-   # "OPC-like",
-   # integrated_obj$transfered_labels
-#)
+# --- Assign confident labels ---
+integrated_obj$transfered_labels_confident <- ifelse(
+    integrated_obj$transfered_label_score >= prediction_score_threshold,
+    integrated_obj$transfered_labels,
+    "Uncertain"
+)
 
+# Factor levels: all observed labels + "Uncertain"
+all_labels <- unique(integrated_obj$transfered_labels)
+integrated_obj$transfered_labels_confident <- factor(
+    integrated_obj$transfered_labels_confident,
+    levels = c(all_labels, "Uncertain")
+)
 
-if (!is.null(prediction_score_threshold) && prediction_score_threshold != "null") {
-    integrated_obj$transfered_labels_confident <- ifelse(
-        integrated_obj$transfered_label_score > as.numeric(prediction_score_threshold),
-        integrated_obj$transfered_labels,
-        "Uncertain"
-    )
-
-
-    integrated_obj$transfered_labels_confident <- ifelse(
-        grepl("OPC-like", integrated_obj$transfered_labels_confident),
-        "OPC-like",
-        integrated_obj$transfered_labels_confident
-    )
-}
-
-
-p1 <- DimPlot(integrated_obj,
+# --- DimPlot (raw labels) ---
+p1 <- DimPlot(
+    integrated_obj,
     group.by = "transfered_labels",
     label = FALSE,
-    cols = custom_palette 
-) +
-    ggtitle("Transferred Labels (Raw)") +
+    cols = custom_palette
+) + ggtitle("Transferred Labels (Raw)") +
     theme(
         axis.title = element_text(size = 12),
         axis.text = element_text(size = 10),
         legend.text = element_text(size = 10)
     )
 
-p2 <- FeaturePlot(integrated_obj,
+# --- FeaturePlot for prediction score ---
+p2 <- FeaturePlot(
+    integrated_obj,
     features = "transfered_label_score"
-) +
-    ggtitle("Prediction Score") +
+) + ggtitle("Prediction Score") +
     theme(
         axis.title = element_text(size = 12),
         axis.text = element_text(size = 10),
         legend.text = element_text(size = 10)
     )
 
-p3 <- VlnPlot(integrated_obj,
+# --- Violin plot by raw labels ---
+p3 <- VlnPlot(
+    integrated_obj,
     features = "transfered_label_score",
     group.by = "transfered_labels",
-    cols = custom_palette 
-) +
-    ggtitle("Prediction Score by Label") +
+    cols = custom_palette
+) + ggtitle("Prediction Score by Label") +
     theme(
         axis.title = element_text(size = 12),
         axis.text = element_text(size = 10),
@@ -337,30 +370,390 @@ p3 <- VlnPlot(integrated_obj,
         axis.text.x = element_text(angle = 45, hjust = 1)
     )
 
+# --- DimPlot for confident labels ---
+p4 <- DimPlot(
+    integrated_obj,
+    group.by = "transfered_labels_confident",
+    label = FALSE,
+    cols = custom_palette
+) + ggtitle("Confident Subtype Annotations") +
+    theme(
+        axis.title = element_text(size = 12),
+        axis.text = element_text(size = 10),
+        legend.text = element_text(size = 10)
+    )
 
-
-
+# --- Save plots ---
 ggsave(label_plot_output, p1, width = umap_width, height = umap_height)
 ggsave(score_plot_output, p2, width = umap_width, height = umap_height)
 ggsave(violin_plot_output, p3, width = umap_width, height = umap_height)
+ggsave(confident_plot_output, p4, width = umap_width, height = umap_height)
 
 
-if (!is.null(prediction_score_threshold) && prediction_score_threshold != "null") {
-    p4 <- DimPlot(integrated_obj, 
-        group.by = "transfered_labels_confident", 
-        label = FALSE,
-        cols = custom_palette 
+# Get all confident labels except "Uncertain"
+all_labels <- setdiff(unique(integrated_obj$transfered_labels_confident), "Uncertain")
+
+# --- Folder for individual UMAPs ---
+output_umap_folder <- here("output/Individual_UMAPs")
+if (!dir.exists(output_umap_folder)) {
+  dir.create(output_umap_folder)
+}
+
+
+all_labels <- setdiff(unique(integrated_obj$transfered_labels_confident), "Uncertain")
+
+# Loop through each label and save an individual UMAP to output/
+for (lab in all_labels) {
+  plot_file <- here("output", paste0("UMAP_", lab, ".pdf"))
+  
+  p <- DimPlot(
+    integrated_obj,
+    group.by = "transfered_labels_confident",
+    cells.highlight = WhichCells(integrated_obj, expression = transfered_labels_confident == lab),
+    cols.highlight = custom_palette[lab],
+    cols = "lightgrey"
+  ) +
+    ggtitle(paste("UMAP for", lab)) +
+    theme(
+      axis.title = element_text(size = 12),
+      axis.text = element_text(size = 10)
+    )
+  
+  ggsave(plot_file, p, width = 8, height = 6)
+}
+
+
+# --- Save labeled Seurat object ---
+saveRDS(integrated_obj, labeled_seurat_obj_output)
+
+```
+
+```{r}
+library(dplyr)
+library(ggplot2)
+library(here)
+
+# Prepare data
+plot_data <- integrated_obj@meta.data %>%
+  select(condition, transfered_labels_confident) %>%
+  filter(transfered_labels_confident != "Uncertain") %>%
+  group_by(condition, transfered_labels_confident) %>%
+  summarise(Count = n(), .groups = 'drop') %>%
+  group_by(condition) %>%
+  mutate(
+    Total_Count = sum(Count),
+    Proportion = Count / Total_Count,
+    Percentage = Proportion * 100
+  ) %>%
+  ungroup()
+
+# Keep conditions in the exact order you want
+plot_data$condition <- factor(plot_data$condition, levels = c("NS", "BP_Control", "BP_Cues"))
+
+# Reorder subtypes within each condition by proportion (largest at bottom)
+plot_data <- plot_data %>%
+  group_by(condition) %>%
+  arrange(Percentage) %>%
+  mutate(transfered_labels_confident = factor(transfered_labels_confident, levels = transfered_labels_confident)) %>%
+  ungroup()
+
+# Distinct color palette
+custom_palette <- c(
+    "AC-like"     = "#1b9e77",  # dark teal
+    "MES-like"    = "#d95f02",  # burnt orange
+    "Microglia"   = "#7570b3",  # purple
+    "OC-like"     = "#e7298a",  # pink
+    "OPC-like-1"  = "#66a61e",  # green
+    "OPC-like-2"  = "#e6ab02",  # yellow-orange
+    "OPC-like-3"  = "#a6761d"   # brown
+)
+
+# Plot
+p_dist <- ggplot(plot_data, aes(x = condition, y = Percentage, fill = transfered_labels_confident)) +
+  geom_bar(stat = "identity", position = "stack", color = "black", linewidth = 0.5) +
+  geom_text(aes(label = sprintf("%.1f%%", Percentage)),
+            position = position_stack(vjust = 0.5), size = 4, color = "white", fontface = "bold") +
+  scale_fill_manual(values = custom_palette) +
+  labs(
+    title = "Distribution of Confident Subtypes Across Conditions",
+    x = "Condition",
+    y = "Proportion (%)",
+    fill = "Subtype"
+  ) +
+  theme_pubr() + theme(legend.position = "right")
+
+# Save to output/
+ggsave(here("output/stacked_barplot_distribution.pdf"), p_dist, width = 8, height = 6)
+
+
+```
+
+
+
+```{r}
+#--- Load object
+#integrated_obj <- readRDS(here("data/processed/Filbin_labeled_integrated_obj.rds"))
+
+#--- Read gene sets (each column = module; entries = gene symbols)
+modules_scores <- read_xlsx(here("data/Filbin_GSE184357/module_scores.xlsx"), skip = 3)
+
+#--- Keep only lineage/state modules (no cell-cycle)
+wanted_modules <- c("MES1","MES2","AC","OPC","NPC1","NPC2")
+modules_scores <- modules_scores %>% dplyr::select(any_of(wanted_modules))
+
+#--- Make list of gene vectors
+module_list <- lapply(modules_scores, function(col) na.omit(as.character(col)))
+names(module_list) <- colnames(modules_scores)
+
+#--- Keep genes present in object (and drop tiny sets)
+module_list_present <- lapply(module_list, function(genes) intersect(genes, rownames(integrated_obj)))
+module_list_present <- module_list_present[sapply(module_list_present, length) >= 5]
+if (length(module_list_present) == 0) stop("No valid genes found for modules!")
+
+#--- 0) Remove any previous module-score clutter to avoid MES12/AC3 etc.
+old_cols <- grep("^(MES|AC|OPC|NPC)", colnames(integrated_obj@meta.data), value = TRUE)
+keep_cols <- setdiff(colnames(integrated_obj@meta.data), setdiff(old_cols, "condition"))
+integrated_obj@meta.data <- integrated_obj@meta.data[, keep_cols, drop = FALSE]
+
+#--- 1) Add scores one module at a time (independent controls; clean names)
+for (m in names(module_list_present)) {
+  integrated_obj <- AddModuleScore(
+    integrated_obj,
+    features = list(module_list_present[[m]]),
+    name = m               # produces m1
+  )
+  old <- paste0(m, "1")
+  if (old %in% colnames(integrated_obj@meta.data)) {
+    colnames(integrated_obj@meta.data)[match(old, colnames(integrated_obj@meta.data))] <- m
+  }
+}
+
+#--- 2) Prepare data for violin plotting (RAW scores, no z-score)
+meta <- integrated_obj@meta.data
+score_cols <- intersect(names(module_list_present), colnames(meta))
+if (length(score_cols) == 0) stop("No score columns found after scoring.")
+
+plot_df <- meta %>%
+  dplyr::select(condition, dplyr::all_of(score_cols)) %>%
+  tidyr::pivot_longer(cols = dplyr::all_of(score_cols),
+                      names_to = "module", values_to = "score")
+
+# Optional: fix condition order if you have a preferred one
+# plot_df$condition <- factor(plot_df$condition, levels = c("NS","BP_Control","BP_Cues"))
+
+#--- 3) Violin plot (RAW scores). Use free_y since modules have different ranges.
+p_violin <- ggplot(plot_df, aes(x = condition, y = score, fill = condition)) +
+  geom_violin(scale = "width", trim = TRUE, linewidth = 0.25) +
+  stat_summary(fun = median, geom = "point", size = 0.9, color = "black") +
+  facet_wrap(~ module, ncol = 3, scales = "free_y") +
+  guides(fill = "none") +
+  labs(x = NULL, y = "Raw module score per cell",
+       title = "Lineage/state program activity across conditions (raw scores)") +
+  theme_minimal(base_size = 11) +
+  theme(panel.grid.minor = element_blank(),
+        axis.text.x = element_text(angle = 30, hjust = 1))
+
+print(p_violin)
+
+#--- 4) Save sized PDF
+ggsave(here("output/violin_lineage_modules_by_condition_raw.pdf"),
+       p_violin, width = 9, height = 7, units = "in")
+```
+
+
+## Do next comparison of clusters between conditions
+## Look at overlap between clusters and different labels (Heatmap of proprotions)
+```{r}
+Idents(integrated_obj) <- "condition"
+deg_all <- FindAllMarkers(
+  integrated_obj,
+  only.pos = FALSE,
+  logfc.threshold = 0.25,
+  min.pct = 0.1
+)
+
+```
+
+```{r}
+# Use old.ident directly as the condition label
+integrated_obj[["condition"]] <- data.frame(
+  condition = as.character(integrated_obj@meta.data$old.ident),
+  row.names = Cells(integrated_obj)
+)
+
+# Check counts
+table(integrated_obj$condition, useNA = "ifany")
+
+# Then proceed to pseudobulk aggregation
+state_col <- "transfered_labels_confident"
+
+agg_sc <- AggregateExpression(
+  integrated_obj,
+  group.by = c(state_col, "condition"),
+  assays = "RNA",
+  slot = "data",
+  return.seurat = TRUE
+)
+
+state_col <- "transfered_labels_confident"
+conds <- levels(factor(integrated_obj$condition))
+pairs <- combn(conds, 2, simplify = FALSE)
+
+# Make readable pseudobulk names like "AC-like_No_Matrix"
+colnames(agg_sc) <- paste(agg_sc@meta.data[[state_col]], agg_sc@meta.data$condition, sep = "_")
+pb_name <- function(st, cond) paste(st, cond, sep = "_")
+
+all_states <- sort(unique(integrated_obj@meta.data[[state_col]]))
+dir.create("output/pseudobulk_scatter", recursive = TRUE, showWarnings = FALSE)
+
+for (st in all_states) {
+  have <- sapply(conds, \(cc) pb_name(st, cc) %in% colnames(agg_sc))
+  if (!all(have)) next
+  panels <- map(pairs, \(p) {
+    a <- pb_name(st, p[1]); b <- pb_name(st, p[2])
+    CellScatter(agg_sc, a, b) + ggtitle(paste0(st, ": ", p[2], " vs ", p[1]))
+  })
+  ggsave(file.path("output/pseudobulk_scatter", paste0("CellScatter_", st, ".pdf")),
+         cowplot::plot_grid(plotlist = panels, nrow = 1), width = 5*length(pairs), height = 5)
+}
+```
+
+```{r}
+agg_cond <- AggregateExpression(
+  integrated_obj,
+  group.by = "condition",
+  assays = "RNA",
+  slot   = "data",          # log-normalized means
+  return.seurat = TRUE
+)
+print(agg_cond@meta.data$condition)
+mat <- as.matrix(GetAssayData(agg_cond, slot = "data"))   # genes x conditions
+
+# PCA
+pca <- prcomp(t(mat), scale. = TRUE)
+df  <- data.frame(pca$x, condition = agg_cond@meta.data$condition)
+ggplot(df, aes(PC1, PC2, color = condition)) +
+  geom_point(size = 5) + theme_cowplot() +
+  labs(title = "Pseudobulk PCA (global): conditions")
+ggsave("output/Global_PCA_conditions.pdf", width = 6, height = 5)
+
+# Correlation between condition profiles
+pheatmap(cor(mat), main = "Global pseudobulk correlation (conditions)",
+         filename = "output/Global_correlation_conditions.pdf")
+```
+```{r}
+state_col <- "transfered_labels_confident"
+
+# Make sure your 3 condition labels are set as identities
+Idents(integrated_obj) <- "condition"
+conds <- levels(factor(integrated_obj$condition))
+stopifnot(length(conds) >= 2)
+
+# --- 1) Pseudobulk per *condition* (all cells pooled) ---
+agg_cond <- AggregateExpression(
+  integrated_obj,
+  group.by = "condition",
+  assays = "RNA",
+  slot   = "data",          # log-normalized means
+  return.seurat = TRUE
+)
+# Columns in agg_cond are your conditions (one pseudobulk "cell" per condition)
+
+plot_scatter_pair_builtin <- function(
+  obj, cond1, cond2,
+  topN = 10,
+  rank_metric = c("abs_logFC", "logFC"),
+  min_mean = 0,
+  show_corr = TRUE,
+  corr_method = c("pearson","spearman"),
+  label_top = FALSE,
+  pt.size = 0.2,
+  pt.alpha = 0.5,
+  top_pt.size = 0.8,
+  top_pt.alpha = 0.95,
+  top_pt.col = "firebrick",
+  line_size_top = 0.2,   # thinner lines for top labels
+  seed = 123
+) {
+  rank_metric <- match.arg(rank_metric)
+  corr_method <- match.arg(corr_method)
+
+  # pull expression matrix
+  mat <- as.matrix(GetAssayData(obj, slot = "data"))
+  stopifnot(all(c(cond1, cond2) %in% colnames(mat)))
+
+  df <- data.frame(
+    x = mat[, cond1],
+    y = mat[, cond2],
+    gene = rownames(mat),
+    mean_xy = rowMeans(mat[, c(cond1, cond2), drop = FALSE]),
+    stringsAsFactors = FALSE
+  )
+  if (min_mean > 0) df <- df[df$mean_xy >= min_mean, , drop = FALSE]
+
+  df$delta <- df$y - df$x
+  score <- if (rank_metric == "abs_logFC") abs(df$delta) else df$delta
+  ord <- order(score, decreasing = TRUE, na.last = NA)
+  top_genes <- df$gene[head(ord, topN)]
+
+  # Build scatter plot directly
+  set.seed(seed)
+  p <- ggplot(df, aes(x = x, y = y)) +
+    geom_point(size = pt.size, alpha = pt.alpha, color = "grey40") +
+    # highlight top genes in red
+    geom_point(
+      data = subset(df, gene %in% top_genes),
+      aes(x = x, y = y),
+      color = top_pt.col,
+      size = top_pt.size,
+      alpha = top_pt.alpha
     ) +
-        ggtitle("Figure 4. Confident Subtype Annotations (Filbin)") +
-        theme(
-            axis.title = element_text(size = 12),
-            axis.text = element_text(size = 10),
-            legend.text = element_text(size = 10)
-        )
-    ggsave(confident_plot_output, p4, width = umap_width, height = umap_height)
-    print(p4) 
-} else {
-    print("Skipping Confident Plot: prediction_score_threshold set to null.")
+    xlab(paste0(cond1, " (log expr)")) +
+    ylab(paste0(cond2, " (log expr)")) +
+    ggtitle(paste0(cond2, " vs ", cond1)) +
+    theme_cowplot() +
+    theme(aspect.ratio = 1)
+
+  # correlation text
+  if (show_corr) {
+    ct <- suppressWarnings(cor.test(df$x, df$y, method = corr_method))
+    lab <- sprintf("%s r = %.3f (p = %.2g)",
+                   tools::toTitleCase(corr_method), ct$estimate, ct$p.value)
+    p <- p + annotate("text", x = -Inf, y = Inf, hjust = -0.05, vjust = 1.3, label = lab)
+  }
+
+  # label top genes (repel)
+  if (label_top) {
+    p <- p + ggrepel::geom_text_repel(
+      data = subset(df, gene %in% top_genes),
+      aes(label = gene),
+      color = top_pt.col,
+      size = 3,
+      force = 2,
+      segment.size = line_size_top,  # thinner lines
+      box.padding = 0.3,
+      point.padding = 0.1,
+      max.overlaps = Inf
+    )
+  }
+
+  p
+}
+
+# --- 3) Make ALL pairwise global plots and save ---
+dir.create("output/global_scatter", recursive = TRUE, showWarnings = FALSE)
+pairs <- combn(colnames(agg_cond), 2, simplify = FALSE)
+
+for (p in pairs) {
+  g <- plot_scatter_pair_global(
+    cond1 = p[1],
+    cond2 = p[2],
+    topN_auto = 10
+  )
+  outfile <- file.path("output/global_scatter",
+                       paste0("CellScatter_GLOBAL_", p[2], "_vs_", p[1], ".pdf"))
+  ggsave(outfile, g, width = 5, height = 5)
 }
 
 ```
+
