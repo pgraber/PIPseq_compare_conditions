@@ -1305,35 +1305,58 @@ ggsave(here::here("output", paste0("TopFC_", st, "_", c2, "_vs_", c1, ".pdf")), 
 
 
 ```{r}
-# --- DE within one state using FindMarkers (cond2 vs cond1) ---
-state_col <- "transfered_labels_confident"
-st  <- "MES-like"   # <- pick a state
-c1  <- "NS"        # <- condition A
-c2  <- "BP_Cues"   # <- condition B
+library(Seurat)
+library(dplyr)
+library(here)
 
-obj_st <- subset(integrated_obj, subset = !!as.name(state_col) == st)
-Idents(obj_st) <- "condition"
+states <- c("AC-like","MES-like","OPC-like-1","OPC-like-2")
+conds  <- c("NS","BP_Control","BP_Cues")  # from unique(integrated_obj$condition)
+outdir <- here("output","de_within_state_all_pairs")
+dir.create(outdir, recursive = TRUE, showWarnings = FALSE)
 
-de_st <- FindMarkers(
-  obj_st,
-  ident.1 = c2, ident.2 = c1,      # direction: up = higher in c2
-  test.use = "wilcox",
-  min.pct = 0.10,
-  logfc.threshold = 0.25
-)
+safe_name <- function(x) gsub("[^A-Za-z0-9._-]+", "_", x)
+summary_rows <- list()
 
-de_st$gene <- rownames(de_st)
-de_st <- de_st[order(-abs(de_st$avg_log2FC)), ]
+for (st in states) {
+  obj_st <- subset(integrated_obj, subset = transfered_labels_confident == st)
+  if (ncol(obj_st) < 10) next
+  Idents(obj_st) <- "condition"
 
-# save table
-# Make sure the folder exists
-outdir <- here("output", "de_within_state")
-dir.create(outdir, showWarnings = FALSE, recursive = TRUE)
+  pairs <- combn(conds, 2, simplify = FALSE)
+  for (pp in pairs) {
+    c1 <- pp[1]; c2 <- pp[2]
+    if (sum(obj_st$condition == c1) < 10 || sum(obj_st$condition == c2) < 10) next
 
-# Construct the full path inside that folder
-outfile <- file.path(outdir, paste0("DE_", st, "_", c2, "_vs_", c1, ".csv"))
+    # Run DE using all cells
+    de_tab <- FindMarkers(
+      obj_st, ident.1 = c2, ident.2 = c1,
+      test.use = "wilcox", min.pct = 0.10, logfc.threshold = 0.25
+    )
 
-# Save table
-write.csv(de_st, outfile, row.names = FALSE)
+    de_tab$gene <- rownames(de_tab)
+    de_tab <- de_tab[order(-abs(de_tab$avg_log2FC)), ]
+
+    fname <- paste0("DE_", safe_name(st), "_", safe_name(c2), "_vs_", safe_name(c1), ".csv")
+    write.csv(de_tab, file.path(outdir, fname), row.names = FALSE)
+
+    summary_rows[[length(summary_rows)+1]] <- data.frame(
+      state = st,
+      contrast = paste0(c2, " vs ", c1),
+      n_cells_c1 = sum(obj_st$condition == c1),
+      n_cells_c2 = sum(obj_st$condition == c2),
+      n_genes_up = sum(de_tab$avg_log2FC >  0.25, na.rm = TRUE),
+      n_genes_down = sum(de_tab$avg_log2FC < -0.25, na.rm = TRUE)
+    )
+    message("Done: ", st, " (", c2, " vs ", c1, ")")
+  }
+}
+
+if (length(summary_rows)) {
+  summary_df <- bind_rows(summary_rows)
+  write.csv(summary_df, file.path(outdir, "SUMMARY_all_pairs.csv"), row.names = FALSE)
+  print(summary_df)
+}
+
+
 ```
 
