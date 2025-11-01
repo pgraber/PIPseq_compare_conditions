@@ -37,6 +37,7 @@ library(org.Hs.eg.db)
 library(cowplot)
 library(purrr)
 library(cowplot)
+library(ggrepel)
 
 opts_knit$set(root.dir = here())
 ```
@@ -257,7 +258,7 @@ confident_plot_output <- here("output/confident_plot.pdf")
 
 # --- Parameters ---
 dims <- 30
-prediction_score_threshold <- 0.7
+prediction_score_threshold <- 0.5
 annotation_column <- "annotation"
 filter_values <- c("G2M", "S") 
 umap_width <- 12 
@@ -433,9 +434,13 @@ library(dplyr)
 library(ggplot2)
 library(here)
 
+integrated_obj[["condition"]] <- data.frame(
+  condition = as.character(integrated_obj@meta.data$old.ident),
+  row.names = Cells(integrated_obj)
+)
 # Prepare data
 plot_data <- integrated_obj@meta.data %>%
-  select(condition, transfered_labels_confident) %>%
+  dplyr::select(condition, transfered_labels_confident) %>%
   filter(transfered_labels_confident != "Uncertain") %>%
   group_by(condition, transfered_labels_confident) %>%
   summarise(Count = n(), .groups = 'drop') %>%
@@ -447,15 +452,18 @@ plot_data <- integrated_obj@meta.data %>%
   ) %>%
   ungroup()
 
-# Keep conditions in the exact order you want
-plot_data$condition <- factor(plot_data$condition, levels = c("NS", "BP_Control", "BP_Cues"))
 
 # Reorder subtypes within each condition by proportion (largest at bottom)
 plot_data <- plot_data %>%
   group_by(condition) %>%
-  arrange(Percentage) %>%
-  mutate(transfered_labels_confident = factor(transfered_labels_confident, levels = transfered_labels_confident)) %>%
+  arrange(Percentage) %>%  # smallest first -> biggest at bottom
+  mutate(
+    transfered_labels_confident =
+      factor(transfered_labels_confident,
+             levels = unique(transfered_labels_confident))
+  ) %>%
   ungroup()
+
 
 # Distinct color palette
 custom_palette <- c(
@@ -468,18 +476,24 @@ custom_palette <- c(
     "OPC-like-3"  = "#a6761d"   # brown
 )
 
+
 # Plot
-p_dist <- ggplot(plot_data, aes(x = condition, y = Percentage, fill = transfered_labels_confident)) +
+p_dist <- ggplot(
+  plot_data,
+  aes(
+    x = condition,
+    y = Percentage,
+    fill = transfered_labels_confident,
+    group = interaction(condition, transfered_labels_confident),  # <- add
+    order = -Percentage                                          # <- add
+  )
+) +
   geom_bar(stat = "identity", position = "stack", color = "black", linewidth = 0.5) +
   geom_text(aes(label = sprintf("%.1f%%", Percentage)),
             position = position_stack(vjust = 0.5), size = 4, color = "white", fontface = "bold") +
   scale_fill_manual(values = custom_palette) +
-  labs(
-    title = "Distribution of Confident Subtypes Across Conditions",
-    x = "Condition",
-    y = "Proportion (%)",
-    fill = "Subtype"
-  ) +
+  labs(title = "Distribution of Confident Subtypes Across Conditions",
+       x = "Condition", y = "Proportion (%)", fill = "Subtype") +
   theme_pubr() + theme(legend.position = "right")
 
 # Save to output/
@@ -488,6 +502,24 @@ ggsave(here("output/stacked_barplot_distribution.pdf"), p_dist, width = 8, heigh
 
 ```
 
+```{r}
+composition_table <- plot_data %>%
+  dplyr::select(condition, transfered_labels_confident, Percentage) %>%
+  tidyr::pivot_wider(names_from = transfered_labels_confident,
+                     values_from = Percentage,
+                     values_fill = 0) %>%
+  left_join(
+    plot_data %>%
+      distinct(condition, Total_Count),
+    by = "condition"
+  ) %>%
+  arrange(condition)
+
+composition_table
+
+write.csv(composition_table, "output/Composition_table_percentages.csv", row.names = FALSE)
+
+```
 
 
 ```{r}
@@ -641,24 +673,69 @@ ggsave("output/Global_PCA_conditions.pdf", width = 6, height = 5)
 pheatmap(cor(mat), main = "Global pseudobulk correlation (conditions)",
          filename = "output/Global_correlation_conditions.pdf")
 ```
+
+
 ```{r}
 state_col <- "transfered_labels_confident"
 
-# Make sure your 3 condition labels are set as identities
+ ---- Input object & identities ----
 Idents(integrated_obj) <- "condition"
 conds <- levels(factor(integrated_obj$condition))
 stopifnot(length(conds) >= 2)
 
-# --- 1) Pseudobulk per *condition* (all cells pooled) ---
+# ---- 1) Pseudobulk per condition (log-normalized means) ----
 agg_cond <- AggregateExpression(
   integrated_obj,
   group.by = "condition",
   assays = "RNA",
-  slot   = "data",          # log-normalized means
+  slot   = "data",
   return.seurat = TRUE
 )
-# Columns in agg_cond are your conditions (one pseudobulk "cell" per condition)
+dir.create("output", showWarnings = FALSE)
+message("Conditions: ", paste(agg_cond@meta.data$condition, collapse = ", "))
 
+# Matrix genes x conditions
+mat <- as.matrix(GetAssayData(agg_cond, slot = "data"))
+
+# ---- 2) PCA on pseudobulk ----
+pca <- prcomp(t(mat), scale. = TRUE)
+df  <- data.frame(pca$x, condition = agg_cond@meta.data$condition)
+p_pca <- ggplot(df, aes(PC1, PC2, color = condition)) +
+  geom_point(size = 5) +
+  theme_cowplot() +
+  labs(title = "Pseudobulk PCA (global): conditions")
+ggsave("output/Global_PCA_conditions.pdf", p_pca, width = 6, height = 5, useDingbats = FALSE)
+
+# ---- 3) Correlations across conditions (matrices + heatmaps + tidy pairwise) ----
+cor_pear <- cor(mat, method = "pearson", use = "pairwise.complete.obs")
+cor_spea <- cor(mat, method = "spearman", use = "pairwise.complete.obs")
+write.csv(cor_pear, "output/Global_correlation_Pearson_conditions.csv")
+write.csv(cor_spea, "output/Global_correlation_Spearman_conditions.csv")
+
+pheatmap(cor_pear,
+  main = "Global pseudobulk correlation (conditions) — Pearson",
+  filename = "output/Global_correlation_Pearson_conditions.pdf"
+)
+pheatmap(cor_spea,
+  main = "Global pseudobulk correlation (conditions) — Spearman",
+  filename = "output/Global_correlation_Spearman_conditions.pdf"
+)
+
+pairs_tab <- do.call(rbind, combn(colnames(mat), 2, FUN = function(pp) {
+  x <- mat[, pp[1]]; y <- mat[, pp[2]]
+  ct_p <- suppressWarnings(cor.test(x, y, method = "pearson"))
+  ct_s <- suppressWarnings(cor.test(x, y, method = "spearman"))
+  data.frame(
+    cond1 = pp[1], cond2 = pp[2],
+    n_genes = sum(complete.cases(x, y)),
+    pearson_r  = unname(ct_p$estimate), pearson_p  = ct_p$p.value,
+    spearman_r = unname(ct_s$estimate), spearman_p = ct_s$p.value,
+    stringsAsFactors = FALSE
+  )
+}, simplify = FALSE))
+write.csv(pairs_tab, "output/Global_pairwise_correlations.csv", row.names = FALSE)
+
+# ---- 4) Plot function: scatter per pair (no line, red topN, thin label segments) ----
 plot_scatter_pair_builtin <- function(
   obj, cond1, cond2,
   topN = 10,
@@ -672,13 +749,13 @@ plot_scatter_pair_builtin <- function(
   top_pt.size = 0.8,
   top_pt.alpha = 0.95,
   top_pt.col = "firebrick",
-  line_size_top = 0.2,   # thinner lines for top labels
+  line_size_top = 0.2,
   seed = 123
 ) {
   rank_metric <- match.arg(rank_metric)
   corr_method <- match.arg(corr_method)
+  set.seed(seed)
 
-  # pull expression matrix
   mat <- as.matrix(GetAssayData(obj, slot = "data"))
   stopifnot(all(c(cond1, cond2) %in% colnames(mat)))
 
@@ -696,17 +773,12 @@ plot_scatter_pair_builtin <- function(
   ord <- order(score, decreasing = TRUE, na.last = NA)
   top_genes <- df$gene[head(ord, topN)]
 
-  # Build scatter plot directly
-  set.seed(seed)
   p <- ggplot(df, aes(x = x, y = y)) +
     geom_point(size = pt.size, alpha = pt.alpha, color = "grey40") +
-    # highlight top genes in red
     geom_point(
       data = subset(df, gene %in% top_genes),
       aes(x = x, y = y),
-      color = top_pt.col,
-      size = top_pt.size,
-      alpha = top_pt.alpha
+      color = top_pt.col, size = top_pt.size, alpha = top_pt.alpha
     ) +
     xlab(paste0(cond1, " (log expr)")) +
     ylab(paste0(cond2, " (log expr)")) +
@@ -714,7 +786,296 @@ plot_scatter_pair_builtin <- function(
     theme_cowplot() +
     theme(aspect.ratio = 1)
 
-  # correlation text
+  if (show_corr) {
+    ct <- suppressWarnings(cor.test(df$x, df$y, method = corr_method))
+    lab <- sprintf("%s r = %.3f (p = %.2g)",
+                   tools::toTitleCase(corr_method), ct$estimate, ct$p.value)
+    p <- p + annotate("text", x = -Inf, y = Inf, hjust = -0.05, vjust = 1.3, label = lab)
+  }
+  if (label_top) {
+    p <- p + ggrepel::geom_text_repel(
+      data = subset(df, gene %in% top_genes),
+      aes(label = gene),
+      color = top_pt.col, size = 3, force = 2,
+      segment.size = line_size_top, box.padding = 0.3,
+      point.padding = 0.1, max.overlaps = Inf
+    )
+  }
+  p
+}
+
+# ---- 5) CSV writer for most-different genes per pair ----
+write_pair_diff_csv <- function(
+  obj, cond1, cond2,
+  out_dir   = "output/global_scatter",
+  topK      = 100,
+  min_mean  = 0,
+  rank_by   = c("abs_lnFC","lnFC"),
+  write_full = TRUE
+) {
+  rank_by <- match.arg(rank_by)
+  mat <- as.matrix(GetAssayData(obj, slot = "data"))
+  stopifnot(all(c(cond1, cond2) %in% colnames(mat)))
+
+  df <- data.frame(
+    gene     = rownames(mat),
+    x_log    = mat[, cond1],
+    y_log    = mat[, cond2],
+    mean_log = rowMeans(mat[, c(cond1, cond2), drop = FALSE]),
+    stringsAsFactors = FALSE
+  )
+  if (min_mean > 0) df <- df[df$mean_log >= min_mean, , drop = FALSE]
+
+  df$lnFC      <- df$y_log - df$x_log
+  df$abs_lnFC  <- abs(df$lnFC)
+  df$log2FC    <- df$lnFC / log(2)
+  df$FC        <- exp(df$lnFC)
+  df$direction <- ifelse(df$lnFC > 0, paste0("up in ", cond2),
+                         ifelse(df$lnFC < 0, paste0("up in ", cond1), "tie"))
+  ord_col <- if (rank_by == "abs_lnFC") "abs_lnFC" else "lnFC"
+  df <- df[order(df[[ord_col]], decreasing = TRUE), ]
+  df$rank <- seq_len(nrow(df))
+  df <- df[, c("rank","gene","x_log","y_log","mean_log","lnFC","abs_lnFC","log2FC","FC","direction")]
+
+  dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+  short_name <- paste0("TOP", topK, "_", cond2, "_vs_", cond1, ".csv")
+  full_name  <- paste0("ALL_", cond2, "_vs_", cond1, ".csv")
+  write.csv(head(df, topK), file.path(out_dir, short_name), row.names = FALSE)
+  if (write_full) write.csv(df, file.path(out_dir, full_name), row.names = FALSE)
+  invisible(df)
+}
+
+# ---- 6) Generate all pairwise plots + CSVs + a combined table ----
+dir.create("output/global_scatter", recursive = TRUE, showWarnings = FALSE)
+pairs <- combn(colnames(agg_cond), 2, simplify = FALSE)
+
+all_pairs_table <- lapply(pairs, function(pp) {
+  cond1 <- pp[1]; cond2 <- pp[2]
+
+  # Plot
+  g <- plot_scatter_pair_builtin(
+    obj = agg_cond, cond1 = cond1, cond2 = cond2,
+    topN = 10, rank_metric = "abs_logFC",
+    min_mean = 0.1, show_corr = TRUE, corr_method = "pearson",
+    label_top = FALSE
+  )
+  gfile <- file.path("output/global_scatter",
+                     paste0("CellScatter_GLOBAL_", cond2, "_vs_", cond1, ".pdf"))
+  ggsave(gfile, g, width = 5, height = 5, useDingbats = FALSE)
+
+  # CSVs
+  df_pair <- write_pair_diff_csv(
+    obj = agg_cond, cond1 = cond1, cond2 = cond2,
+    out_dir = "output/global_scatter",
+    topK = 100, min_mean = 0.1, rank_by = "abs_lnFC", write_full = TRUE
+  )
+  # add contrast column for combined export
+  df_pair$contrast <- paste0(cond2, "_vs_", cond1)
+  df_pair
+})
+
+combined_df <- do.call(rbind, all_pairs_table)
+# Reorder columns for readability
+combined_df <- combined_df[, c("contrast","rank","gene","x_log","y_log","mean_log",
+                               "lnFC","abs_lnFC","log2FC","FC","direction")]
+write.csv(combined_df, "output/global_scatter/COMBINED_all_pairs_diffs.csv", row.names = FALSE)
+
+message("Done. Outputs in ./output and ./output/global_scatter")
+
+```
+
+
+```{r}
+# --- helper to compute & write "most different genes" tables ---
+write_pair_diff_csv <- function(
+  obj, cond1, cond2,
+  out_dir   = "output/global_scatter",
+  topK      = 100,                 # how many to export in the top file
+  min_mean  = 0,                   # filter tiny/noisy genes by mean log expr
+  rank_by   = c("abs_lnFC","lnFC"),# ranking metric
+  write_full = TRUE                # also write the full (unfiltered) table
+) {
+  rank_by <- match.arg(rank_by)
+
+  mat <- as.matrix(GetAssayData(obj, slot = "data"))  # log-normalized (ln scale)
+  stopifnot(all(c(cond1, cond2) %in% colnames(mat)))
+
+  df <- data.frame(
+    gene   = rownames(mat),
+    x_log  = mat[, cond1],
+    y_log  = mat[, cond2],
+    mean_log = rowMeans(mat[, c(cond1, cond2), drop = FALSE]),
+    stringsAsFactors = FALSE
+  )
+  if (min_mean > 0) df <- df[df$mean_log >= min_mean, , drop = FALSE]
+
+  # Differences on log scale
+  df$lnFC     <- df$y_log - df$x_log                   # natural log fold-change
+  df$abs_lnFC <- abs(df$lnFC)
+  df$log2FC   <- df$lnFC / log(2)                      # convert to log2
+  df$FC       <- exp(df$lnFC)                          # linear fold-change
+  df$direction <- ifelse(df$lnFC > 0, paste0("up in ", cond2),
+                         ifelse(df$lnFC < 0, paste0("up in ", cond1), "tie"))
+
+  # order & rank
+  ord_col <- if (rank_by == "abs_lnFC") "abs_lnFC" else "lnFC"
+  df <- df[order(df[[ord_col]], decreasing = TRUE), ]
+  df$rank <- seq_len(nrow(df))
+
+  # nice column order
+  df <- df[, c("rank","gene",
+               "x_log","y_log","mean_log",
+               "lnFC","abs_lnFC","log2FC","FC","direction")]
+
+  # write CSVs
+  dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+  short_name <- paste0("TOP", topK, "_", cond2, "_vs_", cond1, ".csv")
+  full_name  <- paste0("ALL_", cond2, "_vs_", cond1, ".csv")
+  utils::write.csv(head(df, topK),
+                   file = file.path(out_dir, short_name), row.names = FALSE)
+  if (write_full) {
+    utils::write.csv(df, file = file.path(out_dir, full_name), row.names = FALSE)
+  }
+  invisible(df)
+}
+```
+
+```{r}
+# ---- Setup ----
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(ggplot2)
+  library(ggrepel)
+  library(cowplot)
+  library(pheatmap)
+})
+theme_set(theme_cowplot())
+set.seed(123)
+
+# ---- Input object & identities ----
+Idents(integrated_obj) <- "condition"
+conds <- levels(factor(integrated_obj$condition))
+stopifnot(length(conds) >= 2)
+
+# ---- 1) Pseudobulk per condition ----
+agg_cond <- AggregateExpression(
+  integrated_obj,
+  group.by = "condition",
+  assays = "RNA",
+  slot   = "data",
+  return.seurat = TRUE
+)
+dir.create("output", showWarnings = FALSE)
+message("Conditions: ", paste(agg_cond@meta.data$condition, collapse = ", "))
+
+mat <- as.matrix(GetAssayData(agg_cond, slot = "data"))
+
+# ---- 2) PCA ----
+pca <- prcomp(t(mat), scale. = TRUE)
+df  <- data.frame(pca$x, condition = agg_cond@meta.data$condition)
+ggplot(df, aes(PC1, PC2, color = condition)) +
+  geom_point(size = 5) +
+  theme_cowplot() +
+  labs(title = "Pseudobulk PCA (global): conditions")
+ggsave("output/Global_PCA_conditions.pdf", width = 6, height = 5, useDingbats = FALSE)
+
+# ---- 3) Correlation matrices and heatmaps ----
+cor_pear <- cor(mat, method = "pearson", use = "pairwise.complete.obs")
+cor_spea <- cor(mat, method = "spearman", use = "pairwise.complete.obs")
+
+write.csv(cor_pear, "output/Global_correlation_Pearson_conditions.csv")
+write.csv(cor_spea, "output/Global_correlation_Spearman_conditions.csv")
+
+pheatmap(cor_pear, main = "Global pseudobulk correlation — Pearson",
+         filename = "output/Global_correlation_Pearson_conditions.pdf")
+pheatmap(cor_spea, main = "Global pseudobulk correlation — Spearman",
+         filename = "output/Global_correlation_Spearman_conditions.pdf")
+
+pairs_tab <- do.call(rbind, combn(colnames(mat), 2, FUN = function(pp) {
+  x <- mat[, pp[1]]; y <- mat[, pp[2]]
+  ct_p <- suppressWarnings(cor.test(x, y, method = "pearson"))
+  ct_s <- suppressWarnings(cor.test(x, y, method = "spearman"))
+  data.frame(
+    cond1 = pp[1], cond2 = pp[2],
+    n_genes = sum(complete.cases(x, y)),
+    pearson_r = unname(ct_p$estimate),
+    pearson_p = ct_p$p.value,
+    spearman_r = unname(ct_s$estimate),
+    spearman_p = ct_s$p.value,
+    stringsAsFactors = FALSE
+  )
+}, simplify = FALSE))
+write.csv(pairs_tab, "output/Global_pairwise_correlations.csv", row.names = FALSE)
+print(pairs_tab)
+
+# ---- Helper: remove 45° line from CellScatter ----
+.rm_abline <- function(p) {
+  keep <- vapply(p$layers, function(L) !inherits(L$geom, "GeomAbline"), logical(1))
+  p$layers <- p$layers[keep]
+  p
+}
+
+# ---- 4) Built-in style scatter plot with LabelPoints ----
+plot_scatter_pair_builtin <- function(
+  obj, cond1, cond2,
+  topN = 10,
+  rank_metric = c("abs_logFC", "logFC"),
+  min_mean = 0,
+  show_corr = TRUE,
+  corr_method = c("pearson","spearman"),
+  label_top = TRUE,
+  pt.size = 0.2,
+  pt.alpha = 0.5,
+  top_pt.size = 0.8,
+  top_pt.alpha = 0.95,
+  top_pt.col = "firebrick",
+  line_size_top = 0.2,
+  seed = 123
+) {
+  rank_metric <- match.arg(rank_metric)
+  corr_method <- match.arg(corr_method)
+  set.seed(seed)
+
+  mat <- as.matrix(GetAssayData(obj, slot = "data"))
+  stopifnot(all(c(cond1, cond2) %in% colnames(mat)))
+
+  df <- data.frame(
+    x = mat[, cond1],
+    y = mat[, cond2],
+    gene = rownames(mat),
+    mean_xy = rowMeans(mat[, c(cond1, cond2), drop = FALSE]),
+    stringsAsFactors = FALSE
+  )
+  if (min_mean > 0) df <- df[df$mean_xy >= min_mean, , drop = FALSE]
+
+  df$delta <- df$y - df$x
+  score <- if (rank_metric == "abs_logFC") abs(df$delta) else df$delta
+  ord <- order(score, decreasing = TRUE, na.last = NA)
+  top_genes <- df$gene[head(ord, topN)]
+
+  # Base plot with CellScatter and top genes highlighted
+  p <- CellScatter(obj, cond1, cond2, highlight = top_genes)
+  p <- .rm_abline(p)
+  p <- p + ggtitle(paste0(cond2, " vs ", cond1)) +
+    xlab(paste0(cond1, " (log expr)")) +
+    ylab(paste0(cond2, " (log expr)")) +
+    theme_cowplot() + theme(aspect.ratio = 1)
+
+  # Make base dots smaller and more transparent
+  if (length(p$layers) >= 1) {
+    p$layers[[1]]$aes_params$size  <- pt.size
+    p$layers[[1]]$aes_params$alpha <- pt.alpha
+  }
+
+  # Overplot red points for top genes
+  p <- p + geom_point(
+    data = subset(df, gene %in% top_genes),
+    aes(x = x, y = y),
+    inherit.aes = FALSE,
+    size = top_pt.size, alpha = top_pt.alpha, color = top_pt.col
+  )
+
+  # Add correlation label
   if (show_corr) {
     ct <- suppressWarnings(cor.test(df$x, df$y, method = corr_method))
     lab <- sprintf("%s r = %.3f (p = %.2g)",
@@ -722,38 +1083,257 @@ plot_scatter_pair_builtin <- function(
     p <- p + annotate("text", x = -Inf, y = Inf, hjust = -0.05, vjust = 1.3, label = lab)
   }
 
-  # label top genes (repel)
+  # Add gene labels with repel
   if (label_top) {
-    p <- p + ggrepel::geom_text_repel(
-      data = subset(df, gene %in% top_genes),
-      aes(label = gene),
-      color = top_pt.col,
-      size = 3,
-      force = 2,
-      segment.size = line_size_top,  # thinner lines
-      box.padding = 0.3,
-      point.padding = 0.1,
-      max.overlaps = Inf
-    )
+    p <- LabelPoints(plot = p, points = top_genes, repel = TRUE)
+    # Make repel lines thinner
+    p$layers[[length(p$layers)]]$geom_params$segment.size <- line_size_top
   }
 
   p
 }
 
-# --- 3) Make ALL pairwise global plots and save ---
-dir.create("output/global_scatter", recursive = TRUE, showWarnings = FALSE)
-pairs <- combn(colnames(agg_cond), 2, simplify = FALSE)
+# ---- 5) Write per-pair CSVs for top differential genes ----
+write_pair_diff_csv <- function(
+  obj, cond1, cond2,
+  out_dir = "output/global_scatter",
+  topK = 100,
+  min_mean = 0,
+  rank_by = c("abs_lnFC","lnFC"),
+  write_full = TRUE
+) {
+  rank_by <- match.arg(rank_by)
+  mat <- as.matrix(GetAssayData(obj, slot = "data"))
+  stopifnot(all(c(cond1, cond2) %in% colnames(mat)))
 
-for (p in pairs) {
-  g <- plot_scatter_pair_global(
-    cond1 = p[1],
-    cond2 = p[2],
-    topN_auto = 10
+  df <- data.frame(
+    gene     = rownames(mat),
+    x_log    = mat[, cond1],
+    y_log    = mat[, cond2],
+    mean_log = rowMeans(mat[, c(cond1, cond2), drop = FALSE]),
+    stringsAsFactors = FALSE
   )
-  outfile <- file.path("output/global_scatter",
-                       paste0("CellScatter_GLOBAL_", p[2], "_vs_", p[1], ".pdf"))
-  ggsave(outfile, g, width = 5, height = 5)
+  if (min_mean > 0) df <- df[df$mean_log >= min_mean, , drop = FALSE]
+
+  df$lnFC      <- df$y_log - df$x_log
+  df$abs_lnFC  <- abs(df$lnFC)
+  df$log2FC    <- df$lnFC / log(2)
+  df$FC        <- exp(df$lnFC)
+  df$direction <- ifelse(df$lnFC > 0, paste0("up in ", cond2),
+                         ifelse(df$lnFC < 0, paste0("up in ", cond1), "tie"))
+  ord_col <- if (rank_by == "abs_lnFC") "abs_lnFC" else "lnFC"
+  df <- df[order(df[[ord_col]], decreasing = TRUE), ]
+  df$rank <- seq_len(nrow(df))
+  df <- df[, c("rank","gene","x_log","y_log","mean_log","lnFC","abs_lnFC","log2FC","FC","direction")]
+
+  dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+  short_name <- paste0("TOP", topK, "_", cond2, "_vs_", cond1, ".csv")
+  full_name  <- paste0("ALL_", cond2, "_vs_", cond1, ".csv")
+  write.csv(head(df, topK), file.path(out_dir, short_name), row.names = FALSE)
+  if (write_full) write.csv(df, file.path(out_dir, full_name), row.names = FALSE)
+  invisible(df)
 }
 
+# ---- 6) Generate all pairwise plots and CSVs ----
+dir.create("output/global_scatter", recursive = TRUE, showWarnings = FALSE)
+pairs <- combn(colnames(agg_cond), 2, simplify = FALSE)
+all_pairs <- lapply(pairs, function(pp) {
+  cond1 <- pp[1]; cond2 <- pp[2]
+  g <- plot_scatter_pair_builtin(
+    obj = agg_cond, cond1 = cond1, cond2 = cond2,
+    topN = 10, rank_metric = "abs_logFC",
+    min_mean = 0.1, show_corr = TRUE, corr_method = "pearson", label_top = TRUE
+  )
+  gfile <- file.path("output/global_scatter",
+                     paste0("CellScatter_GLOBAL_", cond2, "_vs_", cond1, ".pdf"))
+  ggsave(gfile, g, width = 5, height = 5, useDingbats = FALSE)
+
+  df_pair <- write_pair_diff_csv(
+    obj = agg_cond, cond1 = cond1, cond2 = cond2,
+    out_dir = "output/global_scatter", topK = 100, min_mean = 0.1,
+    rank_by = "abs_lnFC", write_full = TRUE
+  )
+  df_pair$contrast <- paste0(cond2, "_vs_", cond1)
+  df_pair
+})
+
+combined_df <- do.call(rbind, all_pairs)
+combined_df <- combined_df[, c("contrast","rank","gene","x_log","y_log","mean_log",
+                               "lnFC","abs_lnFC","log2FC","FC","direction")]
+write.csv(combined_df, "output/global_scatter/COMBINED_all_pairs_diffs.csv", row.names = FALSE)
+
+message("Done. Outputs in ./output and ./output/global_scatter")
+
+```
+```{r}
+state_col <- "transfered_labels_confident"
+states <- unique(integrated_obj@meta.data[[state_col]])
+state_cells <- lapply(states, function(st) {
+  rownames(integrated_obj@meta.data)[integrated_obj@meta.data[[state_col]] == st]
+})
+names(state_cells) <- states
+
+# one Seurat object per state
+objs_by_state <- setNames(
+  lapply(names(state_cells), function(st) subset(integrated_obj, cells = state_cells[[st]])),
+  names(state_cells)
+)
+
+# quick check: number of cells in each object
+sapply(objs_by_state, ncol)
+
+
+```
+
+```{r}
+# 1) Put OPC states together in the desired left→right order
+state_order <- c("MES-like","AC-like","OPC-like-1","OPC-like-2","OPC-like-3","OC-like","Microglia")
+obj_states$transfered_labels_confident <- factor(obj_states$transfered_labels_confident,
+                                                 levels = state_order)
+
+# 2) (Optional) Also order features by state so genes appear grouped nicely
+features_use <- unlist(
+  lapply(state_order, function(st)
+    top_markers$gene[top_markers$cluster == st])
+)
+
+# 3) Re-plot
+p_dot <- DotPlot(obj_states, features = features_use,
+                 group.by = "transfered_labels_confident") +
+  RotatedAxis() +
+  labs(title = "Top markers per state (OPC subtypes grouped)")
+p_dot
+
+ggsave(here("output/DotPlot_top_markers_per_state.pdf"), p_dot, width = 12, height = 6)
+
+
+```
+```{r}
+# One-state DE between two conditions
+state_col <- "transfered_labels_confident"
+st  <- "AC-like"       # <— choose a state
+c1  <- "NS"            # <— condition A
+c2  <- "BP_Cues"       # <— condition B
+
+obj_st <- subset(integrated_obj, subset = !!as.name(state_col) == st)
+Idents(obj_st) <- "condition"
+
+de_st <- FindMarkers(
+  obj_st, ident.1 = c2, ident.2 = c1,
+  min.pct = 0.1, logfc.threshold = 0.25, test.use = "wilcox"
+)
+
+head(de_st[order(-de_st$avg_log2FC), ], 15)
+
+# Add -log10(p) for visual emphasis
+de_st$gene <- rownames(de_st)
+de_st$neglog10p <- -log10(de_st$p_val_adj + 1e-300)
+
+volcanoggplot(de_st, aes(x = avg_log2FC, y = neglog10p)) +
+  geom_point(alpha = 0.6) +
+  geom_vline(xintercept = c(-0.25, 0.25), linetype = "dashed", color = "grey50") +
+  geom_hline(yintercept = 1.3, linetype = "dashed", color = "grey50") +
+  theme_minimal() +
+  labs(
+    title = paste0(st, ": ", c2, " vs ", c1),
+    x = "Average log2 fold change",
+    y = "-log10 adjusted p-value"
+  )
+
+```
+```{r}
+# --- Helper: pseudobulk mean (log-normalized) per gene for a state × condition ---
+pseudobulk_state <- function(seu, state, cond) {
+  obj <- subset(seu, subset = transfered_labels_confident == state & condition == cond)
+  if (ncol(obj) < 5) stop(paste("Too few cells in", state, cond))
+  Matrix::rowMeans(GetAssayData(obj, slot = "data"))
+}
+
+# --- Compute effect sizes for one state between two conditions ---
+effect_size_table <- function(seu, state, cond1, cond2) {
+  m1 <- pseudobulk_state(seu, state, cond1)
+  m2 <- pseudobulk_state(seu, state, cond2)
+  common <- intersect(names(m1), names(m2))
+  m1 <- m1[common]; m2 <- m2[common]
+  # effect size: difference on log scale ≈ log2FC
+  df <- data.frame(
+    gene = common,
+    meanA = m1, meanB = m2,
+    avg_log2FC = (m2 - m1) / log(2),                 # log2 fold-change
+    mean_ab = 0.5 * (m1 + m2),                       # average log-expression
+    stringsAsFactors = FALSE
+  )
+  df[order(-abs(df$avg_log2FC)), ]
+}
+
+# --- A) MA plot (effect size only) ---
+plot_ma <- function(df, title = "") {
+  ggplot(df, aes(x = mean_ab, y = avg_log2FC)) +
+    geom_hline(yintercept = 0, color = "grey60") +
+    geom_point(alpha = 0.5, size = 0.6) +
+    labs(x = "Average log-normalized expression",
+         y = "log2 fold change (cond2 vs cond1)",
+         title = title) +
+    theme_minimal()
+}
+
+# --- B) Ranked top-|log2FC| bar chart (effect size only) ---
+plot_top_fc <- function(df, topN = 15, title = "") {
+  top <- head(df, topN)
+  ggplot(top, aes(x = reorder(gene, avg_log2FC), y = avg_log2FC, fill = avg_log2FC > 0)) +
+    geom_col() +
+    coord_flip() +
+    scale_fill_manual(values = c("TRUE"="#1b9e77","FALSE"="#d95f02"), guide = "none") +
+    labs(x = NULL, y = "log2 fold change (cond2 vs cond1)", title = title) +
+    theme_minimal()
+}
+
+# ===== Usage: pick a state & conditions =====
+st  <- "MES-like"
+c1  <- "BP_Cues"
+c2  <- "NS"
+
+es <- effect_size_table(integrated_obj, st, c1, c2)
+
+p_ma  <- plot_ma(es,  paste0(st, "  (", c2, " vs ", c1, ")"))
+p_bar <- plot_top_fc(es, topN = 12, title = paste0(st, "  top |log2FC| (", c2, " vs ", c1, ")"))
+
+# Save if you want
+ggsave(here::here("output", paste0("MA_", st, "_", c2, "_vs_", c1, ".pdf")),  p_ma,  width = 5, height = 4)
+ggsave(here::here("output", paste0("TopFC_", st, "_", c2, "_vs_", c1, ".pdf")), p_bar, width = 5, height = 4)
+```
+
+
+```{r}
+# --- DE within one state using FindMarkers (cond2 vs cond1) ---
+state_col <- "transfered_labels_confident"
+st  <- "MES-like"   # <- pick a state
+c1  <- "NS"        # <- condition A
+c2  <- "BP_Cues"   # <- condition B
+
+obj_st <- subset(integrated_obj, subset = !!as.name(state_col) == st)
+Idents(obj_st) <- "condition"
+
+de_st <- FindMarkers(
+  obj_st,
+  ident.1 = c2, ident.2 = c1,      # direction: up = higher in c2
+  test.use = "wilcox",
+  min.pct = 0.10,
+  logfc.threshold = 0.25
+)
+
+de_st$gene <- rownames(de_st)
+de_st <- de_st[order(-abs(de_st$avg_log2FC)), ]
+
+# save table
+# Make sure the folder exists
+outdir <- here("output", "de_within_state")
+dir.create(outdir, showWarnings = FALSE, recursive = TRUE)
+
+# Construct the full path inside that folder
+outfile <- file.path(outdir, paste0("DE_", st, "_", c2, "_vs_", c1, ".csv"))
+
+# Save table
+write.csv(de_st, outfile, row.names = FALSE)
 ```
 
