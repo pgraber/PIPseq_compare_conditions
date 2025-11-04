@@ -766,12 +766,6 @@ deg_all <- FindAllMarkers(
 ```
 
 ```{r}
-# Use old.ident directly as the condition label
-integrated_obj[["condition"]] <- data.frame(
-  condition = as.character(integrated_obj@meta.data$old.ident),
-  row.names = Cells(integrated_obj)
-)
-
 # Check counts
 table(integrated_obj$condition, useNA = "ifany")
 
@@ -814,12 +808,11 @@ agg_cond <- AggregateExpression(
   integrated_obj,
   group.by = "condition",
   assays = "RNA",
-  slot   = "data",          # log-normalized means
+  slot   = "data",          
   return.seurat = TRUE
 )
 print(agg_cond@meta.data$condition)
-mat <- as.matrix(GetAssayData(agg_cond, slot = "data"))   # genes x conditions
-
+mat <- as.matrix(GetAssayData(agg_cond, slot = "data"))   
 # PCA
 pca <- prcomp(t(mat), scale. = TRUE)
 df  <- data.frame(pca$x, condition = agg_cond@meta.data$condition)
@@ -837,7 +830,6 @@ pheatmap(cor(mat), main = "Global pseudobulk correlation (conditions)",
 ```{r}
 state_col <- "transfered_labels_confident"
 
- ---- Input object & identities ----
 Idents(integrated_obj) <- "condition"
 conds <- levels(factor(integrated_obj$condition))
 stopifnot(length(conds) >= 2)
@@ -846,27 +838,36 @@ stopifnot(length(conds) >= 2)
 agg_cond <- AggregateExpression(
   integrated_obj,
   group.by = "condition",
-  assays = "RNA",
-  slot   = "data",
+  assays   = "RNA",
+  slot     = "data",
   return.seurat = TRUE
 )
 dir.create("output", showWarnings = FALSE)
 message("Conditions: ", paste(agg_cond@meta.data$condition, collapse = ", "))
 
-# Matrix genes x conditions
-mat <- as.matrix(GetAssayData(agg_cond, slot = "data"))
+# Matrix genes x conditions (Seurat v5: use 'layer')
+mat <- as.matrix(GetAssayData(agg_cond[["RNA"]], layer = "data"))
+
+# Remove zero-variance genes/columns to avoid prcomp crash
+vars_rows <- apply(mat, 1, var, na.rm = TRUE)
+mat <- mat[vars_rows > 0, , drop = FALSE]
+vars_cols <- apply(mat, 2, var, na.rm = TRUE)
+mat <- mat[, vars_cols > 0, drop = FALSE]
+
+# Check
+message("Genes retained: ", nrow(mat), " | Conditions: ", ncol(mat))
 
 # ---- 2) PCA on pseudobulk ----
+stopifnot(nrow(mat) > 2, ncol(mat) > 1)
 pca <- prcomp(t(mat), scale. = TRUE)
-df  <- data.frame(pca$x, condition = agg_cond@meta.data$condition)
+df  <- data.frame(pca$x, condition = colnames(mat))
 p_pca <- ggplot(df, aes(PC1, PC2, color = condition)) +
-  geom_point(size = 5) +
-  theme_cowplot() +
+  geom_point(size = 5) + theme_cowplot() +
   labs(title = "Pseudobulk PCA (global): conditions")
 ggsave("output/Global_PCA_conditions.pdf", p_pca, width = 6, height = 5, useDingbats = FALSE)
 
-# ---- 3) Correlations across conditions (matrices + heatmaps + tidy pairwise) ----
-cor_pear <- cor(mat, method = "pearson", use = "pairwise.complete.obs")
+# ---- 3) Correlations across conditions ----
+cor_pear <- cor(mat, method = "pearson",  use = "pairwise.complete.obs")
 cor_spea <- cor(mat, method = "spearman", use = "pairwise.complete.obs")
 write.csv(cor_pear, "output/Global_correlation_Pearson_conditions.csv")
 write.csv(cor_spea, "output/Global_correlation_Spearman_conditions.csv")
@@ -894,7 +895,7 @@ pairs_tab <- do.call(rbind, combn(colnames(mat), 2, FUN = function(pp) {
 }, simplify = FALSE))
 write.csv(pairs_tab, "output/Global_pairwise_correlations.csv", row.names = FALSE)
 
-# ---- 4) Plot function: scatter per pair (no line, red topN, thin label segments) ----
+# ---- 4) Plot function: scatter per pair (labels ON for red topN) ----
 plot_scatter_pair_builtin <- function(
   obj, cond1, cond2,
   topN = 10,
@@ -902,34 +903,43 @@ plot_scatter_pair_builtin <- function(
   min_mean = 0,
   show_corr = TRUE,
   corr_method = c("pearson","spearman"),
-  label_top = FALSE,
-  pt.size = 0.2,
+  label_top = TRUE,
+  pt.size = 0.25,
   pt.alpha = 0.5,
-  top_pt.size = 0.8,
+  top_pt.size = 1.0,
   top_pt.alpha = 0.95,
   top_pt.col = "firebrick",
-  line_size_top = 0.2,
+  label_size = 3,
+  line_size_top = 0.3,
   seed = 123
 ) {
   rank_metric <- match.arg(rank_metric)
   corr_method <- match.arg(corr_method)
   set.seed(seed)
 
-  mat <- as.matrix(GetAssayData(obj, slot = "data"))
-  stopifnot(all(c(cond1, cond2) %in% colnames(mat)))
+  # Seurat v5-friendly extraction
+  if (inherits(obj, "Seurat")) {
+    M <- as.matrix(GetAssayData(obj[["RNA"]], layer = "data"))
+  } else if (is.matrix(obj)) {
+    M <- obj
+  } else stop("obj must be a Seurat object or matrix (genes x samples).")
+
+  stopifnot(all(c(cond1, cond2) %in% colnames(M)))
 
   df <- data.frame(
-    x = mat[, cond1],
-    y = mat[, cond2],
-    gene = rownames(mat),
-    mean_xy = rowMeans(mat[, c(cond1, cond2), drop = FALSE]),
+    x = M[, cond1],
+    y = M[, cond2],
+    gene = rownames(M),
     stringsAsFactors = FALSE
   )
+  df <- df[complete.cases(df$x, df$y), , drop = FALSE]
+  df$mean_xy <- rowMeans(df[, c("x","y"), drop = FALSE])
   if (min_mean > 0) df <- df[df$mean_xy >= min_mean, , drop = FALSE]
+  if (nrow(df) == 0) stop("No genes left after filtering (try lower 'min_mean').")
 
   df$delta <- df$y - df$x
-  score <- if (rank_metric == "abs_logFC") abs(df$delta) else df$delta
-  ord <- order(score, decreasing = TRUE, na.last = NA)
+  score    <- if (rank_metric == "abs_logFC") abs(df$delta) else df$delta
+  ord      <- order(score, decreasing = TRUE, na.last = NA)
   top_genes <- df$gene[head(ord, topN)]
 
   p <- ggplot(df, aes(x = x, y = y)) +
@@ -948,16 +958,19 @@ plot_scatter_pair_builtin <- function(
   if (show_corr) {
     ct <- suppressWarnings(cor.test(df$x, df$y, method = corr_method))
     lab <- sprintf("%s r = %.3f (p = %.2g)",
-                   tools::toTitleCase(corr_method), ct$estimate, ct$p.value)
+                   tools::toTitleCase(corr_method), unname(ct$estimate), ct$p.value)
     p <- p + annotate("text", x = -Inf, y = Inf, hjust = -0.05, vjust = 1.3, label = lab)
   }
-  if (label_top) {
+
+  if (label_top && length(top_genes) > 0) {
+    df_top <- subset(df, gene %in% top_genes)
     p <- p + ggrepel::geom_text_repel(
-      data = subset(df, gene %in% top_genes),
-      aes(label = gene),
-      color = top_pt.col, size = 3, force = 2,
-      segment.size = line_size_top, box.padding = 0.3,
-      point.padding = 0.1, max.overlaps = Inf
+      data = df_top,
+      aes(x = x, y = y, label = gene),
+      color = top_pt.col, size = label_size,
+      segment.size = line_size_top,
+      box.padding = 0.4, point.padding = 0.2,
+      force = 2, max.overlaps = Inf
     )
   }
   p
@@ -966,57 +979,75 @@ plot_scatter_pair_builtin <- function(
 # ---- 5) CSV writer for most-different genes per pair ----
 write_pair_diff_csv <- function(
   obj, cond1, cond2,
-  out_dir   = "output/global_scatter",
-  topK      = 100,
-  min_mean  = 0,
-  rank_by   = c("abs_lnFC","lnFC"),
+  out_dir    = "output/global_scatter",
+  topK       = 100,
+  min_mean   = 0,
+  rank_by    = c("abs_lnFC","lnFC"),
   write_full = TRUE
 ) {
   rank_by <- match.arg(rank_by)
-  mat <- as.matrix(GetAssayData(obj, slot = "data"))
-  stopifnot(all(c(cond1, cond2) %in% colnames(mat)))
 
+  # Extract matrix (genes x samples)
+  M <- if (inherits(obj, "Seurat")) {
+    as.matrix(GetAssayData(obj[["RNA"]], layer = "data"))
+  } else if (is.matrix(obj)) {
+    obj
+  } else stop("obj must be a Seurat object or matrix (genes x samples).")
+
+  stopifnot(all(c(cond1, cond2) %in% colnames(M)))
+
+  # Build per-gene table
   df <- data.frame(
-    gene     = rownames(mat),
-    x_log    = mat[, cond1],
-    y_log    = mat[, cond2],
-    mean_log = rowMeans(mat[, c(cond1, cond2), drop = FALSE]),
+    gene     = rownames(M),
+    x_log    = M[, cond1],
+    y_log    = M[, cond2],
     stringsAsFactors = FALSE
   )
+  df <- df[complete.cases(df$x_log, df$y_log), , drop = FALSE]
+  df$mean_log <- rowMeans(df[, c("x_log","y_log")], na.rm = TRUE)
   if (min_mean > 0) df <- df[df$mean_log >= min_mean, , drop = FALSE]
 
-  df$lnFC      <- df$y_log - df$x_log
-  df$abs_lnFC  <- abs(df$lnFC)
-  df$log2FC    <- df$lnFC / log(2)
-  df$FC        <- exp(df$lnFC)
+  # Differences and rankings
+  df$lnFC     <- df$y_log - df$x_log
+  df$abs_lnFC <- abs(df$lnFC)
+  df$log2FC   <- df$lnFC / log(2)
+  df$FC       <- exp(df$lnFC)
   df$direction <- ifelse(df$lnFC > 0, paste0("up in ", cond2),
                          ifelse(df$lnFC < 0, paste0("up in ", cond1), "tie"))
+
   ord_col <- if (rank_by == "abs_lnFC") "abs_lnFC" else "lnFC"
   df <- df[order(df[[ord_col]], decreasing = TRUE), ]
   df$rank <- seq_len(nrow(df))
-  df <- df[, c("rank","gene","x_log","y_log","mean_log","lnFC","abs_lnFC","log2FC","FC","direction")]
 
+  # Order columns (without 'contrast'; caller will add it)
+  df <- df[, c("rank","gene","x_log","y_log","mean_log",
+               "lnFC","abs_lnFC","log2FC","FC","direction")]
+
+  # Write files
   dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
   short_name <- paste0("TOP", topK, "_", cond2, "_vs_", cond1, ".csv")
   full_name  <- paste0("ALL_", cond2, "_vs_", cond1, ".csv")
+
   write.csv(head(df, topK), file.path(out_dir, short_name), row.names = FALSE)
   if (write_full) write.csv(df, file.path(out_dir, full_name), row.names = FALSE)
+
   invisible(df)
 }
 
-# ---- 6) Generate all pairwise plots + CSVs + a combined table ----
-dir.create("output/global_scatter", recursive = TRUE, showWarnings = FALSE)
-pairs <- combn(colnames(agg_cond), 2, simplify = FALSE)
 
-all_pairs_table <- lapply(pairs, function(pp) {
+# ---- 6) Generate all pairwise plots + CSVs + combined table ----
+dir.create("output/global_scatter", recursive = TRUE, showWarnings = FALSE)
+pair_names <- combn(colnames(mat), 2, simplify = FALSE)
+
+all_pairs_table <- lapply(pair_names, function(pp) {
   cond1 <- pp[1]; cond2 <- pp[2]
 
-  # Plot
+  # Plot with labeled red topN genes
   g <- plot_scatter_pair_builtin(
     obj = agg_cond, cond1 = cond1, cond2 = cond2,
     topN = 10, rank_metric = "abs_logFC",
     min_mean = 0.1, show_corr = TRUE, corr_method = "pearson",
-    label_top = FALSE
+    label_top = TRUE
   )
   gfile <- file.path("output/global_scatter",
                      paste0("CellScatter_GLOBAL_", cond2, "_vs_", cond1, ".pdf"))
@@ -1028,19 +1059,16 @@ all_pairs_table <- lapply(pairs, function(pp) {
     out_dir = "output/global_scatter",
     topK = 100, min_mean = 0.1, rank_by = "abs_lnFC", write_full = TRUE
   )
-  # add contrast column for combined export
   df_pair$contrast <- paste0(cond2, "_vs_", cond1)
   df_pair
 })
 
 combined_df <- do.call(rbind, all_pairs_table)
-# Reorder columns for readability
 combined_df <- combined_df[, c("contrast","rank","gene","x_log","y_log","mean_log",
                                "lnFC","abs_lnFC","log2FC","FC","direction")]
 write.csv(combined_df, "output/global_scatter/COMBINED_all_pairs_diffs.csv", row.names = FALSE)
 
 message("Done. Outputs in ./output and ./output/global_scatter")
-
 ```
 
 
@@ -1447,6 +1475,13 @@ volcanoggplot(de_st, aes(x = avg_log2FC, y = neglog10p)) +
 
 ```{r}
 # --- Helper: pseudobulk mean (log-normalized) per gene for a state × condition ---
+label_col <- if ("transferred_labels_confident" %in% colnames(integrated_obj@meta.data))
+  "transferred_labels_confident" else "transfered_labels_confident"
+
+# DE should use SCT (not integrated)
+DefaultAssay(integrated_obj) <- "RNA"
+
+
 pseudobulk_state <- function(seu, state, cond) {
   obj <- subset(seu, subset = transfered_labels_confident == state & condition == cond)
   if (ncol(obj) < 5) stop(paste("Too few cells in", state, cond))
@@ -1513,8 +1548,24 @@ library(Seurat)
 library(dplyr)
 library(here)
 
-states <- c("AC-like","MES-like","OPC-like-1","OPC-like-2")
-conds  <- c("NS","BP_Control","BP_Cues")  # from unique(integrated_obj$condition)
+# ----- Identify the correct label column -----
+label_col <- if ("transferred_labels_confident" %in% colnames(integrated_obj@meta.data))
+  "transferred_labels_confident" else "transfered_labels_confident"
+
+# ----- Use RNA (not integrated) for DE -----
+DefaultAssay(integrated_obj) <- "RNA"
+if ("layers" %in% slotNames(integrated_obj[["RNA"]])) {
+  integrated_obj[["RNA"]] <- JoinLayers(integrated_obj[["RNA"]])
+}
+
+# Derive states/conditions from the object (avoid hard-coding)
+states <- integrated_obj@meta.data[[label_col]] |> as.character() |> unique() |> na.omit() |> sort()
+conds  <- integrated_obj@meta.data$condition       |> as.character() |> unique() |> na.omit() |> sort()
+
+message("Using label column: ", label_col)
+message("States found: ", paste(states, collapse = ", "))
+message("Conditions found: ", paste(conds, collapse = ", "))
+
 outdir <- here("output","de_within_state_all_pairs")
 dir.create(outdir, recursive = TRUE, showWarnings = FALSE)
 
@@ -1522,44 +1573,103 @@ safe_name <- function(x) gsub("[^A-Za-z0-9._-]+", "_", x)
 summary_rows <- list()
 
 for (st in states) {
-  obj_st <- subset(integrated_obj, subset = transfered_labels_confident == st)
-  if (ncol(obj_st) < 10) next
+  # Robust subsetting by cells
+  cells_use <- rownames(integrated_obj@meta.data)[ integrated_obj@meta.data[[label_col]] == st ]
+  if (length(cells_use) < 10) {
+    message("Skip state '", st, "': only ", length(cells_use), " cells.")
+    next
+  }
+
+  obj_st <- subset(integrated_obj, cells = cells_use)
   Idents(obj_st) <- "condition"
 
   pairs <- combn(conds, 2, simplify = FALSE)
   for (pp in pairs) {
-    c1 <- pp[1]; c2 <- pp[2]
-    if (sum(obj_st$condition == c1) < 10 || sum(obj_st$condition == c2) < 10) next
+    c1 <- pp[[1]]; c2 <- pp[[2]]
+    n1 <- sum(obj_st$condition == c1)
+    n2 <- sum(obj_st$condition == c2)
 
-    # Run DE using all cells
+    if (n1 < 10 || n2 < 10) {
+      message("Skip ", st, " (", c2, " vs ", c1, "): n=", n2, " vs ", n1, " (<10).")
+      next
+    }
+
+    # --- DE (Wilcoxon over cells, descriptive) ---
     de_tab <- FindMarkers(
       obj_st, ident.1 = c2, ident.2 = c1,
       test.use = "wilcox", min.pct = 0.10, logfc.threshold = 0.25
     )
+    if (nrow(de_tab) == 0) {
+      message("No DE genes for ", st, " (", c2, " vs ", c1, ").")
+      next
+    }
 
+    # --- Add explicit p.adjust on the tested set ---
+    de_tab$p_adj_BH_tested    <- p.adjust(de_tab$p_val, method = "BH")
+    de_tab$p_adj_bonf_tested  <- p.adjust(de_tab$p_val, method = "bonferroni")
+
+    # --- Recompute detection fractions from RAW COUNTS (strict) ---
+    counts <- GetAssayData(obj_st, slot = "counts")
+    g1 <- colnames(obj_st)[obj_st$condition == c2]  # ident.1
+    g2 <- colnames(obj_st)[obj_st$condition == c1]  # ident.2
+    # fractions of cells with >0 counts
+    pct1_counts <- Matrix::rowMeans(counts[, g1, drop = FALSE] > 0)
+    pct2_counts <- Matrix::rowMeans(counts[, g2, drop = FALSE] > 0)
+
+    # bind as numeric columns (don’t rely only on Seurat’s pct.1/2)
+    de_tab$pct1_counts <- pct1_counts[rownames(de_tab)]
+    de_tab$pct2_counts <- pct2_counts[rownames(de_tab)]
+    de_tab$delta_det_counts <- de_tab$pct1_counts - de_tab$pct2_counts
+
+    # keep Seurat’s pct.1/2 but ensure numeric
+    de_tab$pct.1 <- as.numeric(de_tab$pct.1)
+    de_tab$pct.2 <- as.numeric(de_tab$pct.2)
+
+    # finalize table
     de_tab$gene <- rownames(de_tab)
     de_tab <- de_tab[order(-abs(de_tab$avg_log2FC)), ]
 
-    fname <- paste0("DE_", safe_name(st), "_", safe_name(c2), "_vs_", safe_name(c1), ".csv")
-    write.csv(de_tab, file.path(outdir, fname), row.names = FALSE)
+    # --- Save: raw numeric CSV + pretty TSV for human reading ---
+    fname_base <- paste0("DE_", safe_name(st), "_", safe_name(c2), "_vs_", safe_name(c1))
+
+    # raw numeric CSV (machine-friendly)
+    write.csv(de_tab,
+              file.path(outdir, paste0(fname_base, ".csv")),
+              row.names = FALSE)
+
+    # pretty TSV (human-friendly; rounded)
+    pretty <- de_tab
+    keep_cols <- c("gene","avg_log2FC","p_val","p_val_adj",
+                   "p_adj_BH_tested","p_adj_bonf_tested",
+                   "pct.1","pct.2","pct1_counts","pct2_counts","delta_det_counts")
+    keep_cols <- keep_cols[keep_cols %in% colnames(pretty)]
+    pretty <- pretty[, keep_cols, drop = FALSE]
+    num_cols <- sapply(pretty, is.numeric)
+    pretty[num_cols] <- lapply(pretty[num_cols], function(x) signif(x, 6))
+    write.table(pretty,
+                file = file.path(outdir, paste0(fname_base, "_pretty.tsv")),
+                sep = "\t", quote = FALSE, row.names = FALSE)
 
     summary_rows[[length(summary_rows)+1]] <- data.frame(
       state = st,
       contrast = paste0(c2, " vs ", c1),
-      n_cells_c1 = sum(obj_st$condition == c1),
-      n_cells_c2 = sum(obj_st$condition == c2),
-      n_genes_up = sum(de_tab$avg_log2FC >  0.25, na.rm = TRUE),
+      n_cells_c1 = n1,
+      n_cells_c2 = n2,
+      n_genes_up   = sum(de_tab$avg_log2FC >  0.25, na.rm = TRUE),
       n_genes_down = sum(de_tab$avg_log2FC < -0.25, na.rm = TRUE)
     )
-    message("Done: ", st, " (", c2, " vs ", c1, ")")
+    message("Done: ", st, " (", c2, " vs ", c1, ") -> ", fname_base, ".csv / _pretty.tsv")
   }
 }
 
 if (length(summary_rows)) {
-  summary_df <- bind_rows(summary_rows)
+  summary_df <- dplyr::bind_rows(summary_rows)
   write.csv(summary_df, file.path(outdir, "SUMMARY_all_pairs.csv"), row.names = FALSE)
   print(summary_df)
+} else {
+  message("No contrasts were run. Check state names, condition names, and per-condition cell counts (>=10).")
 }
+
 
 
 ```
