@@ -38,6 +38,8 @@ library(cowplot)
 library(purrr)
 library(cowplot)
 library(ggrepel)
+library(ComplexHeatmap)
+library(circlize)
 
 opts_knit$set(root.dir = here())
 ```
@@ -49,63 +51,71 @@ seurat_biofunctional <- readRDS(here("data/seurat_biofunctional.rds"))
 ```
 
 ```{r}
-# 1. Create a list of your three Seurat objects
-# This is the starting point for anchor-based integration
-obj_list <- list(
-  seurat_neurospheres,
-  seurat_bioinert,
-  seurat_biofunctional
+# 1) Load & tag
+NS         <- readRDS(here("data/seurat_neurospheres.rds"))
+BP_Control <- readRDS(here("data/seurat_bioinert.rds"))
+BP_Cues    <- readRDS(here("data/seurat_biofunctional.rds"))
+
+NS$condition         <- "NS"
+BP_Control$condition <- "BP_Control"
+BP_Cues$condition    <- "BP_Cues"
+
+# 2) Merge to one object
+obj <- merge(NS, y = list(BP_Control, BP_Cues))
+DefaultAssay(obj) <- "RNA"
+
+obj[["RNA"]] <- JoinLayers(obj[["RNA"]])
+obj[["RNA"]] <- split(obj[["RNA"]], f = obj$condition)
+
+# 2) Unintegrated workflow (as in the vignette)
+DefaultAssay(obj) <- "RNA"
+obj <- NormalizeData(obj)
+obj <- FindVariableFeatures(obj)
+obj <- ScaleData(obj)
+obj <- RunPCA(obj)
+obj <- FindNeighbors(obj, dims = 1:30, reduction = "pca")
+obj <- FindClusters(obj, resolution = 2, cluster.name = "unintegrated_clusters")
+obj <- RunUMAP(obj, dims = 1:30, reduction = "pca", reduction.name = "umap.unintegrated")
+
+# 3) Integrate layers (adds an integrated reduction)
+obj <- IntegrateLayers(
+  object         = obj,
+  method         = CCAIntegration,
+  orig.reduction = "pca",
+  new.reduction  = "integrated.cca",
+  verbose        = FALSE
 )
 
-names(obj_list) <- c("NS", "BP_Control", "BP_Cues")
+# 4) Neighbors / clusters / UMAP on the integrated reduction
+obj <- FindNeighbors(obj, reduction = "integrated.cca", dims = 1:30)
+obj <- FindClusters(obj, resolution = 0.6)
+obj <- RunUMAP(obj, dims = 1:30, reduction = "integrated.cca")
+```
 
-for (i in 1:length(obj_list)) {
-  obj_list[[i]]$condition <- names(obj_list)[i]
-}
 
-obj_list <- lapply(X = obj_list, FUN = function(x) {
-  SCTransform(x, vst.flavor = "v2", verbose = FALSE, conserve.memory = TRUE) %>%
-  RunPCA(npcs = 30, verbose = FALSE)
-})
 
-features <- SelectIntegrationFeatures(object.list = obj_list, nfeatures = 2000)
+
+```{r}
+saveRDS(obj, file = here("data/processed/integrated_seurat.rds"))
 ```
 
 ```{r}
-# 1. Prepare data for SCT integration
-obj_list <- PrepSCTIntegration(object.list = obj_list, anchor.features = features)
 
-# 2. Find the integration anchors
-anchors <- FindIntegrationAnchors(
-  object.list = obj_list,
-  normalization.method = "SCT",
-  anchor.features = features
+integrated_obj <- readRDS(here("data/processed/integrated_seurat.rds"))
+
+# 4) Neighbors / clusters / UMAP on the integrated reduction
+integrated_obj <- FindNeighbors(integrated_obj, reduction = "integrated.cca", dims = 1:30)
+integrated_obj <- FindClusters(integrated_obj, resolution = 0.6)
+
+integrated_obj <- RunUMAP(
+  integrated_obj,
+  reduction      = "integrated.cca",
+  dims           = 1:30,
+  reduction.name = "umap_res0.6",  
+  reduction.key  = "UMAP06_",
+  verbose        = FALSE
 )
 
-# 3. Integrate the data into a single object
-# The resulting object is named 'integrated_obj' and contains the batch-corrected 'integrated' assay.
-integrated_obj <- IntegrateData(anchorset = anchors, normalization.method = "SCT")
-```
-
-```{r}
-# 1. Set the default assay to 'integrated'
-DefaultAssay(integrated_obj) <- "integrated"
-
-# 2. Run PCA, Clustering, and UMAP on the integrated data
-integrated_obj <- RunPCA(integrated_obj, npcs = 30, verbose = FALSE)
-integrated_obj <- FindNeighbors(integrated_obj, dims = 1:30, verbose = FALSE)
-integrated_obj <- FindClusters(integrated_obj, resolution = 0.6, verbose = FALSE)
-integrated_obj <- RunUMAP(integrated_obj, dims = 1:30, verbose = FALSE)
-
-# 3. Store cluster IDs for analysis
-integrated_obj[["cluster_id"]] <- Idents(object = integrated_obj)
-```
-
-```{r}
-saveRDS(integrated_obj, file = here("data/processed/integrated_seurat.rds"))
-```
-
-```{r}
 condition_colors <- c("NS" = "#808080",      
                            "BP_Control" = "#0072B2", 
                            "BP_Cues" = "#D55E00") 
@@ -114,7 +124,7 @@ condition_order <- c("NS", "BP_Control", "BP_Cues")
 integrated_obj$condition <- factor(integrated_obj$condition, levels = condition_order)
 
 plot_A <- DimPlot(integrated_obj, 
-                  reduction = "umap", 
+                  reduction = "umap_res0.6", 
                   group.by = "condition",
                   cols = condition_colors,
                   label = FALSE) + 
@@ -122,7 +132,7 @@ plot_A <- DimPlot(integrated_obj,
   theme(plot.title = element_text(face = "bold", size = 14))
 
 plot_B <- DimPlot(integrated_obj, 
-                  reduction = "umap", 
+                  reduction = "umap_res0.6", 
                   group.by = "condition",
                   cols = condition_colors, 
                   split.by = "condition",
@@ -148,7 +158,7 @@ base_colors <- c(brewer.pal(n = 12, name = "Set3"),
 cluster_colors <- colorRampPalette(base_colors)(n_clusters)
 
 umap_clusters <- DimPlot(integrated_obj, 
-                  reduction = "umap", 
+                  reduction = "umap_res0.6", 
                   group.by = "seurat_clusters",
                   cols = cluster_colors,
                   label = TRUE, 
@@ -162,14 +172,16 @@ ggsave(umap_clusters, filename = here("output/umap_by_cluster.pdf"), height = 8,
 ```
 
 ```{r}
-DefaultAssay(integrated_obj) <- "integrated"
+DefaultAssay(integrated_obj) <- "RNA"
+
+integrated_obj[["RNA"]] <- JoinLayers(integrated_obj[["RNA"]])
 
 all_cluster_markers <- FindAllMarkers(
   object = integrated_obj, 
   only.pos = TRUE,         
   min.pct = 0.1,           
   logfc.threshold = 0.25,
-  assay = "integrated"
+  assay = "RNA"
 )
 
 top3_markers <- all_cluster_markers %>%
@@ -178,7 +190,6 @@ top3_markers <- all_cluster_markers %>%
 
 genes_to_plot <- unique(top3_markers$gene)
 
-DefaultAssay(integrated_obj) <- "RNA"
 
 cluster_markers_umap <- DotPlot(integrated_obj, 
                   features = genes_to_plot, 
@@ -189,9 +200,12 @@ cluster_markers_umap <- DotPlot(integrated_obj,
   theme(plot.title = element_text(face = "bold", size = 14),
         axis.text.x = element_text(angle = 45, hjust = 1, size = 10))
 
-ggsave(plot_D, filename = here("output/cluster_markers_umap.pdf"), height = 8, width = 12)
+ggsave(cluster_markers_umap, filename = here("output/cluster_markers_umap.pdf"), height = 8, width = 12)
 
 ```
+
+
+
 
 ```{r}
 markers_filtered <- all_cluster_markers %>%
@@ -238,6 +252,8 @@ top_terms <- enrich_df %>%
 top_terms
 
 ```
+
+
 
 
 
@@ -434,10 +450,6 @@ library(dplyr)
 library(ggplot2)
 library(here)
 
-integrated_obj[["condition"]] <- data.frame(
-  condition = as.character(integrated_obj@meta.data$old.ident),
-  row.names = Cells(integrated_obj)
-)
 # Prepare data
 plot_data <- integrated_obj@meta.data %>%
   dplyr::select(condition, transfered_labels_confident) %>%
@@ -519,6 +531,17 @@ composition_table
 
 write.csv(composition_table, "output/Composition_table_percentages.csv", row.names = FALSE)
 
+```
+
+##Cell Cycle Scoring
+
+```{r}
+integrated_obj <- CellCycleScoring(
+  integrated_obj,
+  s.features   = cc.genes.updated.2019$s.genes,
+  g2m.features = cc.genes.updated.2019$g2m.genes,
+  set.ident    = FALSE
+)
 ```
 
 
@@ -1165,6 +1188,7 @@ write.csv(combined_df, "output/global_scatter/COMBINED_all_pairs_diffs.csv", row
 message("Done. Outputs in ./output and ./output/global_scatter")
 
 ```
+
 ```{r}
 state_col <- "transfered_labels_confident"
 states <- unique(integrated_obj@meta.data[[state_col]])
@@ -1186,28 +1210,71 @@ sapply(objs_by_state, ncol)
 ```
 
 ```{r}
-# 1) Put OPC states together in the desired left→right order
-state_order <- c("MES-like","AC-like","OPC-like-1","OPC-like-2","OPC-like-3","OC-like","Microglia")
-obj_states$transfered_labels_confident <- factor(obj_states$transfered_labels_confident,
-                                                 levels = state_order)
+# 0) Identities = transferred labels (states); plot from RNA
+Idents(integrated_obj) <- "transfered_labels_confident"
+DefaultAssay(integrated_obj) <- "RNA"
 
-# 2) (Optional) Also order features by state so genes appear grouped nicely
-features_use <- unlist(
-  lapply(state_order, function(st)
-    top_markers$gene[top_markers$cluster == st])
+# 1) Find markers per state (one vs all)
+all_state_markers <- FindAllMarkers(
+  integrated_obj,
+  only.pos = TRUE,
+  logfc.threshold = 0.25,
+  min.pct = 0.1
 )
 
-# 3) Re-plot
-p_dot <- DotPlot(obj_states, features = features_use,
-                 group.by = "transfered_labels_confident") +
+# 2) Top-k per state (set k as you like)
+k <- 5
+topk_state_markers <- all_state_markers %>%
+  group_by(cluster) %>%
+  slice_max(order_by = avg_log2FC, n = k, with_ties = FALSE) %>%
+  ungroup() %>%
+  rename(state = cluster)
+
+# 3) Left→right order of states (keep only those present)
+state_order <- c("MES-like","AC-like","OPC-like-1","OPC-like-2","OPC-like-3","OC-like","Microglia")
+present_states <- intersect(state_order, levels(Idents(integrated_obj)))
+integrated_obj$transfered_labels_confident <- factor(
+  integrated_obj$transfered_labels_confident, levels = present_states
+)
+
+# 4) Features to plot (exactly the top-k per state, deduped & valid)
+features_use <- unlist(lapply(present_states, function(st) {
+  topk_state_markers %>% filter(state == st) %>% pull(gene)
+}), use.names = FALSE) %>%
+  unique() %>%
+  intersect(rownames(integrated_obj))
+stopifnot(length(features_use) > 0)
+
+# (Optional) Export exactly what will be plotted
+dir.create(here("output"), showWarnings = FALSE, recursive = TRUE)
+write_csv(
+  tibble(state = rep(present_states, each = k)) |>
+    left_join(topk_state_markers, by = c("state")) |>
+    group_by(state) |>
+    slice_head(n = k) |>
+    ungroup() |>
+    select(state, gene, avg_log2FC, p_val_adj),
+  here("output/top_markers_plotted_per_transferred_state.csv")
+)
+
+# 5) DotPlot
+p_dot <- DotPlot(
+  integrated_obj,
+  features = features_use,
+  group.by = "transfered_labels_confident"
+) +
   RotatedAxis() +
-  labs(title = "Top markers per state (OPC subtypes grouped)")
-p_dot
+  labs(title = paste0("Top ", k, " markers per transferred label")) +
+  theme(plot.title = element_text(face = "bold"))
 
-ggsave(here("output/DotPlot_top_markers_per_state.pdf"), p_dot, width = 12, height = 6)
-
+ggsave(
+  here("output/DotPlot_top_markers_per_transferred_state.pdf"),
+  p_dot, width = 12, height = 6, useDingbats = FALSE
+)
 
 ```
+
+
 ```{r}
 # One-state DE between two conditions
 state_col <- "transfered_labels_confident"
@@ -1241,6 +1308,7 @@ volcanoggplot(de_st, aes(x = avg_log2FC, y = neglog10p)) +
   )
 
 ```
+
 ```{r}
 # --- Helper: pseudobulk mean (log-normalized) per gene for a state × condition ---
 pseudobulk_state <- function(seu, state, cond) {
