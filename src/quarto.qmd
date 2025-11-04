@@ -488,6 +488,11 @@ custom_palette <- c(
     "OPC-like-3"  = "#a6761d"   # brown
 )
 
+# --- Reorder conditions for plotting ---
+plot_data$condition <- factor(
+  plot_data$condition,
+  levels = c("NS","BP_Control", "BP_Cues")  
+)
 
 # Plot
 p_dist <- ggplot(
@@ -542,40 +547,161 @@ integrated_obj <- CellCycleScoring(
   g2m.features = cc.genes.updated.2019$g2m.genes,
   set.ident    = FALSE
 )
+
+phase_dim_plot <- DimPlot(integrated_obj, group.by = "Phase") +
+  ggtitle("Cell cycle phase across all cells") +
+  scale_color_manual(values = c(
+    G1  = "#999999",
+    S   = "#56B4E9",
+    G2M = "#E69F00"
+  ))
+
+FeaturePlot(integrated_obj, features = c("S.Score", "G2M.Score"))
+
+# Calculate phase proportions per condition
+phase_counts <- prop.table(table(integrated_obj$Phase, integrated_obj$condition), 2) %>%
+  as.data.frame() %>%
+  dplyr::rename(Phase = Var1, Condition = Var2, Proportion = Freq) %>%
+  mutate(
+    Condition = factor(Condition, levels = c("NS", "BP_Control", "BP_Cueswha")),
+    label = sprintf("%.1f%%", Proportion * 100)   # format labels
+  )
+
+# Barplot with percentage labels inside bars
+phase_barplot <- ggplot(phase_counts, aes(x = Condition, y = Proportion, fill = Phase)) +
+  geom_bar(stat = "identity", position = "fill", color = "black") +
+  geom_text(aes(label = label),
+            position = position_stack(vjust = 0.5),  # centers labels within stacks
+            color = "white", size = 4, fontface = "bold") +
+  scale_fill_manual(values = c(G1="#999999", S="#56B4E9", G2M="#E69F00")) +
+  scale_y_continuous(labels = scales::percent_format()) +
+  labs(
+    title = "Cell-cycle composition across conditions",
+    x = NULL, y = "Fraction of cells", fill = "Phase"
+  ) +
+  theme_pubr() +
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    axis.text = element_text(size = 11),
+    legend.position = "right"
+  )
+
+ggsave(phase_dim_plot, filename = here("output/cell_cycle_phase_umap.pdf"), width = 8, height = 6)
+ggsave(phase_barplot, filename = here("output/cell_cycle_phase_barplot.pdf"), width = 8, height = 6)
+```
+
+```{r}
+meta <- integrated_obj@meta.data
+meta$cycling_group <- ifelse(meta$Phase %in% c("S","G2M"), "Cycling", "Non-Cycling")
+
+DefaultAssay(integrated_obj) <- "RNA"
+state_list <- list(
+  MES1 = MES1_genes,
+  MES2 = MES2_genes,
+  AC   = AC_genes,
+  OPC  = OPC_genes,
+  NPC1 = NPC1_genes,
+  NPC2 = NPC2_genes
+)
+
+integrated_obj <- AddModuleScore(integrated_obj, features = state_list, name = "state_")
+
+```
+
+```{r}
+meta <- integrated_obj@meta.data %>%
+  mutate(
+    state   = transfered_labels_confident,
+    cycling = Phase %in% c("S", "G2M")
+  ) %>%
+  filter(state != "Uncertain")
+
+by_state <- meta %>%
+  group_by(state, condition) %>%
+  summarise(
+    n         = n(),
+    n_cycl    = sum(cycling),
+    frac_cycl = n_cycl / n,
+    .groups   = "drop"
+  )
+
+by_state$condition <- factor(by_state$condition,
+                             levels = c("NS", "BP_Control", "BP_Cues"))
+
+# >>> set your desired order here <<<
+state_order <- c("MES-like",
+                 "OPC-like-1",
+                 "OPC-like-2",
+                 "OPC-like-3",
+                 "AC-like",
+                 "OC-like")
+by_state$state <- factor(by_state$state, levels = state_order)
+
+cycling_fraction_by_state <- ggplot(by_state, aes(state, frac_cycl, fill = condition)) +
+  geom_col(position = position_dodge(width = 0.75), color = "black", width = 0.7) +
+  geom_text(aes(label = scales::percent(frac_cycl, accuracy = 0.1)),
+            position = position_dodge(width = 0.75), vjust = -0.3, size = 3) +
+  scale_y_continuous(labels = scales::percent_format(), limits = c(0, 1)) +
+  scale_fill_manual(values = c(NS = "#808080",
+                               BP_Control = "#0072B2",
+                               BP_Cues = "#D55E00")) +
+  labs(x = NULL, y = "% cycling (S+G2M)", fill = "Condition",
+       title = "Cycling fraction within each predicted state") +
+  theme_pubr() +
+  theme(axis.text.x = element_text(angle = 40, hjust = 1))
+
+ggsave(cycling_fraction_by_state,
+       filename = here("output/cycling_fraction_by_state.pdf"),
+       width = 8, height = 6)
+
 ```
 
 
 ```{r}
-#--- Load object
-#integrated_obj <- readRDS(here("data/processed/Filbin_labeled_integrated_obj.rds"))
+suppressPackageStartupMessages({
+  library(Seurat); library(dplyr); library(readxl); library(here); library(ggplot2); library(tidyr)
+})
 
-#--- Read gene sets (each column = module; entries = gene symbols)
+# --- Load module table ---
 modules_scores <- read_xlsx(here("data/Filbin_GSE184357/module_scores.xlsx"), skip = 3)
 
-#--- Keep only lineage/state modules (no cell-cycle)
 wanted_modules <- c("MES1","MES2","AC","OPC","NPC1","NPC2")
 modules_scores <- modules_scores %>% dplyr::select(any_of(wanted_modules))
 
-#--- Make list of gene vectors
-module_list <- lapply(modules_scores, function(col) na.omit(as.character(col)))
+# --- Build vectors per module, keep only genes present ---
+genes_in_obj <- rownames(integrated_obj)
+module_list <- lapply(modules_scores, function(col) {
+  intersect(unique(na.omit(as.character(col))), genes_in_obj)
+})
 names(module_list) <- colnames(modules_scores)
 
-#--- Keep genes present in object (and drop tiny sets)
-module_list_present <- lapply(module_list, function(genes) intersect(genes, rownames(integrated_obj)))
-module_list_present <- module_list_present[sapply(module_list_present, length) >= 5]
-if (length(module_list_present) == 0) stop("No valid genes found for modules!")
+# Drop tiny sets and show a quick QC
+module_list_present <- module_list[sapply(module_list, length) >= 5]
+stopifnot(length(module_list_present) > 0)
+cat("Genes per module (in object):\n")
+print(sapply(module_list_present, length))
 
-#--- 0) Remove any previous module-score clutter to avoid MES12/AC3 etc.
-old_cols <- grep("^(MES|AC|OPC|NPC)", colnames(integrated_obj@meta.data), value = TRUE)
-keep_cols <- setdiff(colnames(integrated_obj@meta.data), setdiff(old_cols, "condition"))
+# (Optional) stash for reproducibility
+integrated_obj@misc$filbin_gene_sets <- module_list_present
+
+# --- Remove ONLY previous score columns to avoid clutter ---
+score_name_regex <- paste0("^(", paste(names(module_list_present), collapse="|"), ")(\\d+)?$")
+keep_cols <- setdiff(colnames(integrated_obj@meta.data),
+                     grep(score_name_regex, colnames(integrated_obj@meta.data), value = TRUE))
 integrated_obj@meta.data <- integrated_obj@meta.data[, keep_cols, drop = FALSE]
 
-#--- 1) Add scores one module at a time (independent controls; clean names)
+# --- Score modules (explicit assay + seed + ctrl) ---
+DefaultAssay(integrated_obj) <- "RNA"
+set.seed(123)  # reproducible background selection
 for (m in names(module_list_present)) {
   integrated_obj <- AddModuleScore(
     integrated_obj,
     features = list(module_list_present[[m]]),
-    name = m               # produces m1
+    name = m,                  # produces m1
+    nbin = 24,                 # default bins
+    ctrl = 100,                # default control genes per bin; explicit = reproducible
+    assay = "RNA",
+    seed = TRUE
   )
   old <- paste0(m, "1")
   if (old %in% colnames(integrated_obj@meta.data)) {
@@ -583,20 +709,20 @@ for (m in names(module_list_present)) {
   }
 }
 
-#--- 2) Prepare data for violin plotting (RAW scores, no z-score)
+# --- Violin data ---
 meta <- integrated_obj@meta.data
 score_cols <- intersect(names(module_list_present), colnames(meta))
-if (length(score_cols) == 0) stop("No score columns found after scoring.")
+stopifnot(length(score_cols) > 0)
+
+# (Optional) consistent condition order
+# integrated_obj$condition <- factor(integrated_obj$condition, levels = c("NS","BP_Control","BP_Cues"))
 
 plot_df <- meta %>%
   dplyr::select(condition, dplyr::all_of(score_cols)) %>%
   tidyr::pivot_longer(cols = dplyr::all_of(score_cols),
                       names_to = "module", values_to = "score")
 
-# Optional: fix condition order if you have a preferred one
-# plot_df$condition <- factor(plot_df$condition, levels = c("NS","BP_Control","BP_Cues"))
-
-#--- 3) Violin plot (RAW scores). Use free_y since modules have different ranges.
+# --- Violin plot (raw module scores) ---
 p_violin <- ggplot(plot_df, aes(x = condition, y = score, fill = condition)) +
   geom_violin(scale = "width", trim = TRUE, linewidth = 0.25) +
   stat_summary(fun = median, geom = "point", size = 0.9, color = "black") +
@@ -608,11 +734,21 @@ p_violin <- ggplot(plot_df, aes(x = condition, y = score, fill = condition)) +
   theme(panel.grid.minor = element_blank(),
         axis.text.x = element_text(angle = 30, hjust = 1))
 
-print(p_violin)
-
-#--- 4) Save sized PDF
 ggsave(here("output/violin_lineage_modules_by_condition_raw.pdf"),
        p_violin, width = 9, height = 7, units = "in")
+
+
+# Ensure it's present
+integrated_obj$cycling_group <- ifelse(integrated_obj$Phase %in% c("S","G2M"), "Cycling", "Non-Cycling")
+plot_df2 <- integrated_obj@meta.data |>
+  dplyr::select(condition, cycling_group, dplyr::all_of(score_cols)) |>
+  tidyr::pivot_longer(dplyr::all_of(score_cols), names_to="module", values_to="score")
+
+ggplot(plot_df2, aes(condition, score, fill = cycling_group)) +
+  geom_violin(scale="width", trim=TRUE, linewidth=0.25, position="identity", alpha=0.6) +
+  stat_summary(fun=median, geom="point", size=0.8, color="black", position=position_dodge(width=0.9)) +
+  facet_wrap(~ module, ncol=3, scales="free_y") + labs(x=NULL, y="Score")
+
 ```
 
 
