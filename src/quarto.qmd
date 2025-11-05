@@ -101,7 +101,7 @@ saveRDS(obj, file = here("data/processed/integrated_seurat.rds"))
 
 ```{r}
 
-integrated_obj <- readRDS(here("data/processed/integrated_seurat.rds"))
+#integrated_obj <- readRDS(here("data/processed/integrated_seurat.rds"))
 
 # 4) Neighbors / clusters / UMAP on the integrated reduction
 integrated_obj <- FindNeighbors(integrated_obj, reduction = "integrated.cca", dims = 1:30)
@@ -191,7 +191,7 @@ top3_markers <- all_cluster_markers %>%
 genes_to_plot <- unique(top3_markers$gene)
 
 
-cluster_markers_umap <- DotPlot(integrated_obj, 
+cluster_markers_dotplot <- DotPlot(integrated_obj, 
                   features = genes_to_plot, 
                   cols = c("lightgrey", "#D55E00"),
                   dot.scale = 8) + 
@@ -200,7 +200,10 @@ cluster_markers_umap <- DotPlot(integrated_obj,
   theme(plot.title = element_text(face = "bold", size = 14),
         axis.text.x = element_text(angle = 45, hjust = 1, size = 10))
 
-ggsave(cluster_markers_umap, filename = here("output/cluster_markers_umap.pdf"), height = 8, width = 12)
+ggsave(cluster_markers_dotplot, filename = here("output/cluster_markers_dotplot.pdf"), height = 8, width = 12)
+
+readr::write_csv(cluster_markers_dotplot$data,
+                 here("output/cluster_markers_dotplot_values.csv"))
 
 ```
 
