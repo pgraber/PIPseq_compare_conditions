@@ -834,104 +834,110 @@ if (length(res_list)) {
 
 ## GSEA analysis 
 
+
 ```{r}
-# ---- GSEA directly from in-memory DE (same orientation as DE; no flipping) ----
+# ---------- GSEA with clusterProfiler (directly from res_list; no flipping) ----------
 suppressPackageStartupMessages({
   library(dplyr); library(purrr); library(stringr)
-  library(msigdbr); library(fgsea); library(ggplot2); library(here)
+  library(clusterProfiler); library(msigdbr)
+  library(ggplot2); library(here); library(readr)
 })
 
 set.seed(123)
 
-# Hallmark sets (uppercased symbols)
-msig_h <- msigdbr(species = "Homo sapiens", collection = "H") |>
-  transmute(gs_name, gene_symbol = toupper(trimws(gene_symbol))) |>
-  group_by(gs_name) |>
-  reframe(genes = list(unique(gene_symbol))) |>
-  ungroup()
-gsets <- setNames(msig_h$genes, msig_h$gs_name)
+# 1) MSigDB Hallmark TERM2GENE / TERM2NAME using SYMBOLs
+msig_h_tbl <- msigdbr(species = "Homo sapiens", collection = "H")
+TERM2GENE  <- msig_h_tbl %>% transmute(gs_name, gene_symbol = toupper(trimws(gene_symbol)))
+TERM2NAME  <- msig_h_tbl %>% distinct(gs_name, gs_name) %>% rename(term = gs_name, name = term)
 
 safe_filename <- function(x) gsub("[^A-Za-z0-9._-]+", "_", x)
 
-run_gsea_on_contrast_df <- function(de_df, contrast, gsets,
-                                    minSize = 10, maxSize = 500,
-                                    out_dir = here("output","gsea","conditions_from_cells")) {
+# 2) Runner for a single contrast data.frame from res_list
+#    Expect columns: gene, avg_log2FC  (from your FindMarkers)
+run_cp_gsea_on_de <- function(de_df, contrast,
+                              TERM2GENE,
+                              out_dir = here("output","gsea_cp","conditions_from_cells"),
+                              minGSSize = 10, maxGSSize = 500,
+                              pvalueCutoff = 1, pAdjustMethod = "BH") {
   dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
 
-  # Expect: gene, avg_log2FC from FindMarkers
-  stopifnot(all(c("gene","avg_log2FC") %in% names(de_df)))
-
-  dd <- de_df |>
-    mutate(gene = toupper(trimws(gene))) |>
-    filter(!is.na(gene), is.finite(avg_log2FC)) |>
-    arrange(desc(abs(avg_log2FC))) |>
+  # Clean & deduplicate genes; keep strongest signal
+  dd <- de_df %>%
+    mutate(gene = toupper(trimws(gene))) %>%
+    filter(!is.na(gene), is.finite(avg_log2FC)) %>%
+    arrange(desc(abs(avg_log2FC))) %>%
     distinct(gene, .keep_all = TRUE)
 
-  # Ranks EXACTLY as in DE (avg_log2FC > 0 = up in c2 from 'c2_vs_c1')
-  ranks <- dd$avg_log2FC
-  names(ranks) <- dd$gene
-  ranks <- sort(ranks, decreasing = TRUE)
+  # Build ranked vector: keep DE orientation (avg_log2FC > 0 = up in first term of "c2_vs_c1")
+  geneList <- dd$avg_log2FC
+  names(geneList) <- dd$gene
+  geneList <- sort(geneList, decreasing = TRUE)
 
-  # Filter pathways by effective size after intersect
-  eff_sizes <- vapply(gsets, function(gs) length(intersect(gs, names(ranks))), integer(1))
-  gsets_eff <- gsets[eff_sizes >= minSize & eff_sizes <= maxSize]
-  if (!length(gsets_eff) || length(unique(ranks)) < 10) {
-    readr::write_lines("# Empty: insufficient pathway sizes or ranks",
-                       file.path(out_dir, paste0("GSEA_", safe_filename(contrast), "_Hallmark.csv")))
-    warning("Skipping ", contrast, " (no testable pathways).")
+  # clusterProfiler::GSEA with Hallmark (SYMBOL-based)
+  gsea_res <- GSEA(geneList = geneList,
+                   TERM2GENE = TERM2GENE,
+                   pvalueCutoff = pvalueCutoff,
+                   pAdjustMethod = pAdjustMethod,
+                   minGSSize = minGSSize,
+                   maxGSSize = maxGSSize,
+                   verbose = FALSE)
+
+  # Write table (even if empty)
+  out_csv <- file.path(out_dir, paste0("GSEA_cp_", safe_filename(contrast), "_Hallmark.csv"))
+  if (is.null(gsea_res) || nrow(as.data.frame(gsea_res)) == 0) {
+    write_lines("# Empty: no enriched Hallmark sets", out_csv)
+    message("No enriched pathways for ", contrast)
     return(invisible(NULL))
   }
 
-  # Multilevel GSEA (no nperm)
-  fg <- fgsea(pathways = gsets_eff, stats = ranks, minSize = minSize, maxSize = maxSize)
-  out_tbl <- arrange(fg, padj)
+  res_df <- as.data.frame(gsea_res) %>% arrange(p.adjust)
+  write_csv(res_df, out_csv)
 
-  # Save table
-  out_csv <- file.path(out_dir, paste0("GSEA_", safe_filename(contrast), "_Hallmark.csv"))
-  readr::write_csv(out_tbl, out_csv)
+  # Quick plots (optional): top 15 by adjusted p
+  p_dot <- dotplot(gsea_res, showCategory = 15) +
+    ggtitle(paste0("Hallmark GSEA (clusterProfiler) — ", contrast))
+  ggsave(file.path(out_dir, paste0("GSEA_cp_dotplot_", safe_filename(contrast), ".pdf")),
+         p_dot, width = 7, height = 5, useDingbats = FALSE)
 
-  # Quick enrichment plots for top up/down, if present
+  # Enrichment plot for top up & down (if present)
+  top_up  <- res_df %>% filter(NES > 0) %>% slice_min(p.adjust, n = 1, with_ties = FALSE)
+  top_dn  <- res_df %>% filter(NES < 0) %>% slice_min(p.adjust, n = 1, with_ties = FALSE)
+
   plot_one <- function(row) {
     if (nrow(row) == 0) return(NULL)
-    gs <- row$pathway[[1]]
-    p  <- fgsea::plotEnrichment(gsets_eff[[gs]], ranks) + ggtitle(paste0(gs, " (", contrast, ")"))
-    ggsave(file.path(out_dir, paste0("GSEA_enrichmentPlot_",
+    gs <- row$ID[[1]]
+    p  <- enrichplot::gseaplot2(gsea_res, geneSetID = gs, title = paste0(gs, " (", contrast, ")"))
+    ggsave(file.path(out_dir, paste0("GSEA_cp_enrichment_",
            safe_filename(gs), "_", safe_filename(contrast), ".pdf")),
-           p, width = 6, height = 4, useDingbats = FALSE)
+           p, width = 7, height = 5, useDingbats = FALSE)
   }
-  plot_one(out_tbl %>% filter(NES > 0) %>% slice_min(padj, n = 1, with_ties = FALSE))
-  plot_one(out_tbl %>% filter(NES < 0) %>% slice_min(padj, n = 1, with_ties = FALSE))
+  plot_one(top_up); plot_one(top_dn)
 
-  invisible(out_tbl)
+  invisible(res_df)
 }
 
-# Run across all DE contrasts stored in res_list
-out_dir_cells <- here("output","gsea","conditions_from_cells")
-dir.create(out_dir_cells, recursive = TRUE, showWarnings = FALSE)
+# 3) Run across your in-memory DE list
+out_dir_cp <- here("output","gsea_cp","conditions_from_cells")
+dir.create(out_dir_cp, recursive = TRUE, showWarnings = FALSE)
 
 iwalk(res_list, function(de_df, key) {
-  # Prefer the explicit 'contrast' column if present (e.g., "BP_Cues_vs_NS")
+  # Prefer explicit contrast column if present (e.g., "BP_Cues_vs_NS")
   contrast <- if ("contrast" %in% names(de_df)) unique(de_df$contrast)[1] else {
-    parts <- strsplit(key, "\\|")[[1]]  # key is "c1|c2"
-    paste0(parts[2], "_vs_", parts[1])  # c2_vs_c1
+    parts <- strsplit(key, "\\|")[[1]]           # key was "c1|c2" in your loop
+    paste0(parts[2], "_vs_", parts[1])           # c2_vs_c1
   }
-  message("\n=== GSEA (no flip): ", contrast, " ===",
+  message("\n=== clusterProfiler GSEA (no flip): ", contrast, " ===",
           "\n    Convention: NES>0 = enriched in FIRST term of '", contrast, "' (your c2)")
-
-  run_gsea_on_contrast_df(
-    de_df, contrast, gsets,
-    minSize = 10, maxSize = 500,
-    out_dir = out_dir_cells
-  )
+  run_cp_gsea_on_de(de_df, contrast, TERM2GENE, out_dir = out_dir_cp,
+                    minGSSize = 10, maxGSSize = 500)
 })
 
-message("Done. GSEA outputs in: ", out_dir_cells)
-
+message("Done. GSEA (clusterProfiler) outputs in: ", out_dir_cp)
 
 ```
 
 
-
+###
 ```{r}
 # Check counts
 table(integrated_obj$condition, useNA = "ifany")
