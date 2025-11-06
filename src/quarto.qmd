@@ -40,6 +40,8 @@ library(cowplot)
 library(ggrepel)
 library(ComplexHeatmap)
 library(circlize)
+library(fgsea)
+library(msigdbr)
 
 opts_knit$set(root.dir = here())
 ```
@@ -206,7 +208,6 @@ readr::write_csv(cluster_markers_dotplot$data,
                  here("output/cluster_markers_dotplot_values.csv"))
 
 ```
-
 
 
 
@@ -393,6 +394,7 @@ p3 <- VlnPlot(
 # --- DimPlot for confident labels ---
 p4 <- DimPlot(
     integrated_obj,
+    reduction = "umap_res0.6",
     group.by = "transfered_labels_confident",
     label = FALSE,
     cols = custom_palette
@@ -430,6 +432,7 @@ for (lab in all_labels) {
     integrated_obj,
     group.by = "transfered_labels_confident",
     cells.highlight = WhichCells(integrated_obj, expression = transfered_labels_confident == lab),
+    sizes.highlight = 0.2,
     cols.highlight = custom_palette[lab],
     cols = "lightgrey"
   ) +
@@ -758,15 +761,176 @@ ggplot(plot_df2, aes(condition, score, fill = cycling_group)) +
 ## Do next comparison of clusters between conditions
 ## Look at overlap between clusters and different labels (Heatmap of proprotions)
 ```{r}
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(dplyr)
+  library(tibble)
+  library(ggplot2)
+  library(cowplot)
+  library(pheatmap)
+  library(here)
+})
+theme_set(theme_cowplot())
+set.seed(123)
+
+# Use RNA and join layers for DE
+DefaultAssay(integrated_obj) <- "RNA"
+if ("layers" %in% slotNames(integrated_obj[["RNA"]])) {
+  integrated_obj[["RNA"]] <- JoinLayers(integrated_obj[["RNA"]])
+}
+
 Idents(integrated_obj) <- "condition"
-deg_all <- FindAllMarkers(
-  integrated_obj,
-  only.pos = FALSE,
-  logfc.threshold = 0.25,
-  min.pct = 0.1
-)
+conds <- levels(factor(integrated_obj$condition))
+stopifnot(length(conds) >= 2)
+
+outdir <- here("output", "between_condition")
+dir.create(outdir, recursive = TRUE, showWarnings = FALSE)
+
 
 ```
+
+```{r}
+pairs <- combn(conds, 2, simplify = FALSE)
+res_list <- list()
+
+for (pp in pairs) {
+  c1 <- pp[1]; c2 <- pp[2]
+
+  obj_pair <- subset(integrated_obj, subset = condition %in% c(c1, c2))
+  if (ncol(obj_pair) < 50) next  # avoid tiny comparisons
+
+  Idents(obj_pair) <- "condition"
+
+  de <- FindMarkers(
+    obj_pair,
+    ident.1 = c2, ident.2 = c1,     # 'avg_log2FC' > 0 => higher in c2
+    assay = "RNA",
+    test.use = "wilcox",
+    logfc.threshold = 0,            # keep all; you can filter later
+    min.pct = 0.05,
+    only.pos = FALSE
+  )
+
+  de <- de %>%
+    rownames_to_column("gene") %>%
+    mutate(
+      contrast  = paste0(c2, "_vs_", c1),
+      direction = ifelse(avg_log2FC > 0, paste0("up in ", c2),
+                  ifelse(avg_log2FC < 0, paste0("up in ", c1), "tie"))
+    ) %>%
+    relocate(contrast, gene)
+
+  fn <- file.path(outdir, paste0("DE_cells_", c2, "_vs_", c1, ".csv"))
+  write.csv(de, fn, row.names = FALSE)
+  res_list[[paste(c1, c2, sep="|")]] <- de
+}
+
+# Combined table
+if (length(res_list)) {
+  de_all <- bind_rows(res_list)
+  write.csv(de_all, file.path(outdir, "DE_cells_ALL_pairs.csv"), row.names = FALSE)
+}
+```
+
+## GSEA analysis 
+
+```{r}
+# ---- GSEA directly from in-memory DE (same orientation as DE; no flipping) ----
+suppressPackageStartupMessages({
+  library(dplyr); library(purrr); library(stringr)
+  library(msigdbr); library(fgsea); library(ggplot2); library(here)
+})
+
+set.seed(123)
+
+# Hallmark sets (uppercased symbols)
+msig_h <- msigdbr(species = "Homo sapiens", collection = "H") |>
+  transmute(gs_name, gene_symbol = toupper(trimws(gene_symbol))) |>
+  group_by(gs_name) |>
+  reframe(genes = list(unique(gene_symbol))) |>
+  ungroup()
+gsets <- setNames(msig_h$genes, msig_h$gs_name)
+
+safe_filename <- function(x) gsub("[^A-Za-z0-9._-]+", "_", x)
+
+run_gsea_on_contrast_df <- function(de_df, contrast, gsets,
+                                    minSize = 10, maxSize = 500,
+                                    out_dir = here("output","gsea","conditions_from_cells")) {
+  dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+  # Expect: gene, avg_log2FC from FindMarkers
+  stopifnot(all(c("gene","avg_log2FC") %in% names(de_df)))
+
+  dd <- de_df |>
+    mutate(gene = toupper(trimws(gene))) |>
+    filter(!is.na(gene), is.finite(avg_log2FC)) |>
+    arrange(desc(abs(avg_log2FC))) |>
+    distinct(gene, .keep_all = TRUE)
+
+  # Ranks EXACTLY as in DE (avg_log2FC > 0 = up in c2 from 'c2_vs_c1')
+  ranks <- dd$avg_log2FC
+  names(ranks) <- dd$gene
+  ranks <- sort(ranks, decreasing = TRUE)
+
+  # Filter pathways by effective size after intersect
+  eff_sizes <- vapply(gsets, function(gs) length(intersect(gs, names(ranks))), integer(1))
+  gsets_eff <- gsets[eff_sizes >= minSize & eff_sizes <= maxSize]
+  if (!length(gsets_eff) || length(unique(ranks)) < 10) {
+    readr::write_lines("# Empty: insufficient pathway sizes or ranks",
+                       file.path(out_dir, paste0("GSEA_", safe_filename(contrast), "_Hallmark.csv")))
+    warning("Skipping ", contrast, " (no testable pathways).")
+    return(invisible(NULL))
+  }
+
+  # Multilevel GSEA (no nperm)
+  fg <- fgsea(pathways = gsets_eff, stats = ranks, minSize = minSize, maxSize = maxSize)
+  out_tbl <- arrange(fg, padj)
+
+  # Save table
+  out_csv <- file.path(out_dir, paste0("GSEA_", safe_filename(contrast), "_Hallmark.csv"))
+  readr::write_csv(out_tbl, out_csv)
+
+  # Quick enrichment plots for top up/down, if present
+  plot_one <- function(row) {
+    if (nrow(row) == 0) return(NULL)
+    gs <- row$pathway[[1]]
+    p  <- fgsea::plotEnrichment(gsets_eff[[gs]], ranks) + ggtitle(paste0(gs, " (", contrast, ")"))
+    ggsave(file.path(out_dir, paste0("GSEA_enrichmentPlot_",
+           safe_filename(gs), "_", safe_filename(contrast), ".pdf")),
+           p, width = 6, height = 4, useDingbats = FALSE)
+  }
+  plot_one(out_tbl %>% filter(NES > 0) %>% slice_min(padj, n = 1, with_ties = FALSE))
+  plot_one(out_tbl %>% filter(NES < 0) %>% slice_min(padj, n = 1, with_ties = FALSE))
+
+  invisible(out_tbl)
+}
+
+# Run across all DE contrasts stored in res_list
+out_dir_cells <- here("output","gsea","conditions_from_cells")
+dir.create(out_dir_cells, recursive = TRUE, showWarnings = FALSE)
+
+iwalk(res_list, function(de_df, key) {
+  # Prefer the explicit 'contrast' column if present (e.g., "BP_Cues_vs_NS")
+  contrast <- if ("contrast" %in% names(de_df)) unique(de_df$contrast)[1] else {
+    parts <- strsplit(key, "\\|")[[1]]  # key is "c1|c2"
+    paste0(parts[2], "_vs_", parts[1])  # c2_vs_c1
+  }
+  message("\n=== GSEA (no flip): ", contrast, " ===",
+          "\n    Convention: NES>0 = enriched in FIRST term of '", contrast, "' (your c2)")
+
+  run_gsea_on_contrast_df(
+    de_df, contrast, gsets,
+    minSize = 10, maxSize = 500,
+    out_dir = out_dir_cells
+  )
+})
+
+message("Done. GSEA outputs in: ", out_dir_cells)
+
+
+```
+
+
 
 ```{r}
 # Check counts
