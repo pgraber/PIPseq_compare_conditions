@@ -936,45 +936,587 @@ message("Done. GSEA (clusterProfiler) outputs in: ", out_dir_cp)
 
 ```
 
-
-###
 ```{r}
-# Check counts
-table(integrated_obj$condition, useNA = "ifany")
 
-# Then proceed to pseudobulk aggregation
-state_col <- "transfered_labels_confident"
+out_dir_cp <- here("output","gsea_cp","conditions_from_cells")
+files <- list.files(out_dir_cp, pattern = "^GSEA_cp_.*_Hallmark\\.csv$", full.names = TRUE)
 
-agg_sc <- AggregateExpression(
-  integrated_obj,
-  group.by = c(state_col, "condition"),
-  assays = "RNA",
-  slot = "data",
-  return.seurat = TRUE
+top_by_contrast <- lapply(files, function(f){
+  df <- suppressWarnings(read_csv(f, show_col_types = FALSE))
+  if (!nrow(df)) return(NULL)
+  df <- df %>% arrange(p.adjust) %>% mutate(contrast = sub("^GSEA_cp_|_Hallmark\\.csv$", "", basename(f)))
+  df %>% dplyr::select(contrast, ID, NES, p.adjust) %>% head(10)
+})
+top_by_contrast <- bind_rows(top_by_contrast)
+print(top_by_contrast, n = 30)
+
+
+```
+
+```{r}
+library(dplyr)
+library(readr)
+library(stringr)
+library(here)
+library(ggplot2)
+library(forcats)
+
+# Choose the contrast to visualize
+contrast <- "BP_Cues_vs_NS"
+file <- here("output","gsea_cp","conditions_from_cells",
+              paste0("GSEA_cp_", contrast, "_Hallmark.csv"))
+
+# Read GSEA results
+gsea_df <- read_csv(file, show_col_types = FALSE)
+
+# Filter for the two pathways of interest
+pathways <- c("HALLMARK_EPITHELIAL_MESENCHYMAL_TRANSITION",
+              "HALLMARK_TNFA_SIGNALING_VIA_NFKB")
+
+gsea_sel <- gsea_df %>% filter(ID %in% pathways)
+
+# Extract the “core_enrichment” genes for each pathway
+top_genes <- gsea_sel %>%
+  mutate(core_genes = strsplit(core_enrichment, "/")) %>%
+  dplyr::select(ID, core_genes) %>%
+  tidyr::unnest(core_genes) %>%
+  group_by(ID) %>%
+  slice_head(n = 25) %>%       
+  ungroup()
+
+print(top_genes)
+
+
+
+```
+
+
+```{r}
+topN <- 10
+plot_df <- gsea_tidy %>%
+  group_by(contrast) %>% slice_min(padj, n = topN, with_ties = FALSE) %>% ungroup()
+
+ggplot(plot_df, aes(x = contrast, y = pathway,
+                    size = -log10(padj), color = NES)) +
+  geom_point() + coord_flip() +
+  scale_color_gradient2() +
+  labs(x = NULL, y = "Hallmark", size = "-log10(FDR)", color = "NES",
+       title = "Top Hallmarks per contrast") +
+  theme_cowplot()
+
+```
+
+
+## GSEA by cell state
+
+```{r}
+suppressPackageStartupMessages({
+  library(Seurat); library(dplyr); library(purrr); library(readr)
+  library(clusterProfiler); library(msigdbr); library(ggplot2); library(here)
+})
+
+# --- detect label column you use everywhere ---
+label_col <- if ("transferred_labels_confident" %in% colnames(integrated_obj@meta.data))
+  "transferred_labels_confident" else "transfered_labels_confident"
+
+# --- make sure RNA layers are joined (Seurat v5 safety) ---
+DefaultAssay(integrated_obj) <- "RNA"
+if ("layers" %in% slotNames(integrated_obj[["RNA"]])) {
+  integrated_obj[["RNA"]] <- JoinLayers(integrated_obj[["RNA"]])
+}
+
+conds  <- levels(factor(integrated_obj$condition))
+states <- integrated_obj@meta.data[[label_col]] |> as.character() |> unique() |> na.omit() |> sort()
+
+# ---- Hallmark TERM2GENE (SYMBOL) ----
+msig_h_tbl <- msigdbr(species = "Homo sapiens", collection = "H")
+TERM2GENE  <- msig_h_tbl %>% transmute(gs_name, gene_symbol = toupper(trimws(gene_symbol)))
+safe_filename <- function(x) gsub("[^A-Za-z0-9._-]+", "_", x)
+
+# ---- small helper: run CP::GSEA exactly like your global step ----
+run_cp_gsea_on_de <- function(de_df, contrast, term2gene, out_dir,
+                              minGSSize=10, maxGSSize=500, pvalueCutoff=1, pAdjustMethod="BH") {
+  dir.create(out_dir, recursive=TRUE, showWarnings=FALSE)
+  dd <- de_df %>%
+    mutate(gene = toupper(trimws(gene))) %>%
+    filter(!is.na(gene), is.finite(avg_log2FC)) %>%
+    arrange(desc(abs(avg_log2FC))) %>%
+    distinct(gene, .keep_all=TRUE)
+  geneList <- dd$avg_log2FC; names(geneList) <- dd$gene
+  geneList <- sort(geneList, decreasing = TRUE)
+
+  gsea_res <- GSEA(geneList, TERM2GENE = term2gene,
+                   minGSSize=minGSSize, maxGSSize=maxGSSize,
+                   pvalueCutoff=pvalueCutoff, pAdjustMethod=pAdjustMethod, verbose=FALSE)
+
+  out_csv <- file.path(out_dir, paste0("GSEA_cp_", safe_filename(contrast), "_Hallmark.csv"))
+  if (is.null(gsea_res) || nrow(as.data.frame(gsea_res))==0) {
+    write_lines("# Empty: no enriched Hallmark sets", out_csv); return(invisible(NULL))
+  }
+  res_df <- as.data.frame(gsea_res) %>% arrange(p.adjust)
+  write_csv(res_df, out_csv)
+  invisible(res_df)
+}
+
+# ---- run DE + GSEA per state and contrast ----
+pairs <- combn(conds, 2, simplify = FALSE)
+out_dir_ws <- here("output","gsea_cp","within_state")
+dir.create(out_dir_ws, recursive=TRUE, showWarnings=FALSE)
+
+nes_rows <- list()
+
+for (st in states) {
+  obj_st <- subset(integrated_obj, subset = !!as.name(label_col) == st)
+  if (ncol(obj_st) < 50) next
+  Idents(obj_st) <- "condition"
+
+  for (pp in pairs) {
+    c1 <- pp[1]; c2 <- pp[2]
+    if (sum(obj_st$condition %in% c(c1,c2)) < 30) next
+
+    de <- FindMarkers(
+      subset(obj_st, subset = condition %in% c(c1,c2)),
+      ident.1 = c2, ident.2 = c1,
+      assay = "RNA", test.use = "wilcox",
+      logfc.threshold = 0, min.pct = 0.05, only.pos = FALSE
+    ) %>%
+      tibble::rownames_to_column("gene") %>%
+      mutate(contrast = paste0(c2, "_vs_", c1),
+             state = st) %>% relocate(state, contrast, gene)
+
+    contrast <- unique(de$contrast)
+    res <- run_cp_gsea_on_de(
+      de_df = de, contrast = paste0(st, "__", contrast),
+      term2gene = TERM2GENE, out_dir = out_dir_ws
+    )
+    if (!is.null(res)) {
+      nes_rows[[length(nes_rows)+1]] <- res %>%
+        dplyr::select(ID, NES, p.adjust) %>%
+        mutate(state = st, contrast = contrast)
+    }
+  }
+}
+
+nes_tab <- dplyr::bind_rows(nes_rows)
+readr::write_csv(nes_tab, file.path(out_dir_ws, "NES_summary_within_state.csv"))
+
+
+```
+
+```{r}
+suppressPackageStartupMessages({
+  library(Seurat); library(dplyr); library(tidyr); library(purrr)
+  library(ggplot2); library(here); library(msigdbr); library(ComplexHeatmap)
+  library(scales)
+})
+
+# =========================
+# 0) Setup / safety
+# =========================
+label_col <- if ("transferred_labels_confident" %in% colnames(integrated_obj@meta.data))
+  "transferred_labels_confident" else "transfered_labels_confident"
+
+DefaultAssay(integrated_obj) <- "RNA"
+if ("layers" %in% slotNames(integrated_obj[["RNA"]])) {
+  integrated_obj[["RNA"]] <- JoinLayers(integrated_obj[["RNA"]])
+}
+
+# Conditions
+conds  <- levels(factor(integrated_obj$condition))
+
+# Drop labels you don't want
+bad_states <- c("Uncertain", "UNCERTAIN", "Unknown")
+
+# Output dir
+out_dir <- here("output","module_scores_hallmarks")
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+# =========================
+# 1) Get Hallmark gene sets
+# =========================
+targets <- c("HALLMARK_TNFA_SIGNALING_VIA_NFKB",
+             "HALLMARK_EPITHELIAL_MESENCHYMAL_TRANSITION",
+             "HALLMARK_APICAL_JUNCTION")
+
+# map canonical -> pretty names
+score_keys <- c(
+  HALLMARK_TNFA_SIGNALING_VIA_NFKB = "TNFA_NFKB",
+  HALLMARK_EPITHELIAL_MESENCHYMAL_TRANSITION = "EMT",
+  HALLMARK_APICAL_JUNCTION = "APICAL_JUNCTION"
 )
 
-state_col <- "transfered_labels_confident"
-conds <- levels(factor(integrated_obj$condition))
-pairs <- combn(conds, 2, simplify = FALSE)
+msig_h <- msigdbr(species = "Homo sapiens", category = "H") %>%
+  filter(gs_name %in% targets) %>%
+  transmute(gs_name, gene_symbol = toupper(trimws(gene_symbol)))
 
-# Make readable pseudobulk names like "AC-like_No_Matrix"
-colnames(agg_sc) <- paste(agg_sc@meta.data[[state_col]], agg_sc@meta.data$condition, sep = "_")
-pb_name <- function(st, cond) paste(st, cond, sep = "_")
+# Map MSigDB symbols to the symbols present in your object (case-safe)
+obj_genes_upper <- toupper(rownames(integrated_obj))
+map_back <- setNames(rownames(integrated_obj), obj_genes_upper)
 
-all_states <- sort(unique(integrated_obj@meta.data[[state_col]]))
-dir.create("output/pseudobulk_scatter", recursive = TRUE, showWarnings = FALSE)
+gene_list_raw <- split(msig_h$gene_symbol, msig_h$gs_name)
+gene_list_mapped <- lapply(gene_list_raw, function(v){
+  v <- intersect(v, names(map_back))
+  unique(unname(map_back[v]))
+})
+gene_list_mapped <- gene_list_mapped[lengths(gene_list_mapped) > 0]  # drop empties
 
-for (st in all_states) {
-  have <- sapply(conds, \(cc) pb_name(st, cc) %in% colnames(agg_sc))
-  if (!all(have)) next
-  panels <- map(pairs, \(p) {
-    a <- pb_name(st, p[1]); b <- pb_name(st, p[2])
-    CellScatter(agg_sc, a, b) + ggtitle(paste0(st, ": ", p[2], " vs ", p[1]))
-  })
-  ggsave(file.path("output/pseudobulk_scatter", paste0("CellScatter_", st, ".pdf")),
-         cowplot::plot_grid(plotlist = panels, nrow = 1), width = 5*length(pairs), height = 5)
+# For AddModuleScore we need an unnamed list; but we keep names to align later
+features_list <- unname(gene_list_mapped)
+pretty_base   <- unname(score_keys[names(gene_list_mapped)])  # e.g. c("TNFA_NFKB","EMT","APICAL_JUNCTION")
+
+# =========================
+# 2) Add per-cell module scores (idempotent + safe)
+# =========================
+# 2a) remove any previous runs to avoid duplicate-name issues
+old_generic <- grep("^HMK_", colnames(integrated_obj@meta.data), value = TRUE)
+old_pretty  <- grep("_(score)$", colnames(integrated_obj@meta.data), value = TRUE)
+cols_to_drop <- unique(c(old_generic, old_pretty))
+if (length(cols_to_drop)) {
+  integrated_obj@meta.data <- integrated_obj@meta.data[, setdiff(colnames(integrated_obj@meta.data), cols_to_drop), drop = FALSE]
 }
+
+# 2b) add scores and capture new columns
+pre_cols <- colnames(integrated_obj@meta.data)
+integrated_obj <- AddModuleScore(
+  object   = integrated_obj,
+  features = features_list,
+  name     = "HMK_"  # Seurat appends numbers
+)
+post_cols <- colnames(integrated_obj@meta.data)
+new_cols  <- setdiff(post_cols, pre_cols)
+stopifnot(length(new_cols) == length(features_list))
+
+# Rename new cols to pretty names in the same order as features_list/gene_list_mapped
+pretty_names <- paste0(pretty_base, "_score")
+colnames(integrated_obj@meta.data)[match(new_cols, colnames(integrated_obj@meta.data))] <- pretty_names
+score_cols <- pretty_names
+
+# =========================
+# 3) Filter out "Uncertain" and build summaries
+# =========================
+# states to keep (trim whitespace)
+states <- integrated_obj@meta.data[[label_col]] |>
+  as.character() |>
+  trimws() |>
+  setdiff(bad_states) |>
+  na.omit() |>
+  sort()
+
+# meta with scores and labels (filtered)
+meta <- integrated_obj@meta.data %>%
+  tibble::rownames_to_column("cell") %>%
+  dplyr::select(cell, condition, !!label_col, dplyr::all_of(score_cols)) %>%
+  dplyr::rename(state = !!label_col) %>%
+  dplyr::mutate(state = trimws(as.character(state))) %>%
+  dplyr::filter(!is.na(state), state %in% states) %>%
+  droplevels()
+
+# mean ± sd per state × condition × score
+sum_long <- meta %>%
+  tidyr::pivot_longer(dplyr::all_of(score_cols), names_to = "score", values_to = "value") %>%
+  dplyr::group_by(state, condition, score) %>%
+  dplyr::summarise(n = dplyr::n(),
+                   mean = mean(value, na.rm = TRUE),
+                   sd   = sd(value, na.rm = TRUE),
+                   .groups = "drop")
+
+readr::write_csv(sum_long, file.path(out_dir, "module_scores_state_by_condition_means.csv"))
+
+# =========================
+# 4) Heatmap: mean scores (states × score•condition)
+# =========================
+heat_mat <- sum_long %>%
+  tidyr::unite("score_cond", score, condition, sep = " • ") %>%
+  dplyr::select(state, score_cond, mean) %>%
+  tidyr::pivot_wider(names_from = score_cond, values_from = mean) %>%
+  tibble::column_to_rownames("state") %>%
+  as.matrix()
+
+pdf(file.path(out_dir, "ModuleScore_Heatmap_states_by_score_condition.pdf"), width = 10, height = 6)
+ComplexHeatmap::Heatmap(heat_mat, name = "mean score",
+                        cluster_rows = TRUE, cluster_columns = TRUE,
+                        column_title = "Hallmark module scores by condition",
+                        row_title = "Cell state")
+dev.off()
+
+# =========================
+# 5) Violins: per score, grouped by state, faceted by condition
+# =========================
+p_violin <- meta %>%
+  tidyr::pivot_longer(dplyr::all_of(score_cols), names_to = "score", values_to = "value") %>%
+  dplyr::mutate(score = factor(score, levels = paste0(pretty_base, "_score"))) %>%
+  ggplot(aes(x = state, y = value, fill = state)) +
+  geom_violin(scale = "width", trim = TRUE) +
+  geom_boxplot(width = 0.12, outlier.size = 0.3, alpha = 0.6) +
+  facet_wrap(~ condition + score, ncol = length(conds), scales = "free_y") +
+  theme_bw() + theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(x = "Cell state", y = "Module score",
+       title = "Hallmark module scores by state and condition")
+ggsave(file.path(out_dir, "ModuleScore_violins_by_state_condition.pdf"),
+       p_violin, width = 12, height = 7)
+
+# =========================
+# 6) Top-20% contributors: which states dominate high scorers?
+# =========================
+top_contrib <- meta %>%
+  tidyr::pivot_longer(dplyr::all_of(score_cols), names_to = "score", values_to = "value") %>%
+  dplyr::group_by(score) %>%
+  dplyr::mutate(thresh = quantile(value, 0.80, na.rm = TRUE),
+                high = value >= thresh) %>%
+  dplyr::ungroup() %>%
+  dplyr::filter(high) %>%
+  dplyr::count(score, condition, state, name = "n_cells") %>%
+  dplyr::group_by(score, condition) %>%
+  dplyr::mutate(frac_within_condition = n_cells / sum(n_cells)) %>%
+  dplyr::ungroup()
+
+readr::write_csv(top_contrib, file.path(out_dir, "Top20pct_contributors_by_state.csv"))
+
+p_bar <- top_contrib %>%
+  dplyr::mutate(score = factor(score, levels = paste0(pretty_base, "_score"))) %>%
+  ggplot(aes(x = condition, y = frac_within_condition, fill = state)) +
+  geom_col() +
+  facet_wrap(~ score, ncol = length(pretty_base)) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  labs(x = "Condition", y = "Share of high-scoring cells",
+       title = "Which states contribute the top 20% module scores?") +
+  theme_bw()
+ggsave(file.path(out_dir, "Top20pct_contributors_stacked_bar.pdf"),
+       p_bar, width = 10, height = 5)
+
+# =========================
+# 7) UMAP overlays of per-cell module scores (split by condition)
+#     (also excluding Uncertain by subsetting the object for plotting)
+# =========================
+# cells to keep (no "Uncertain")
+keep_cells <- WhichCells(
+  integrated_obj,
+  expression = trimws(as.character(get(label_col))) %in% states
+)
+
+# make a lightweight plotting object with UMAP but NO graphs
+obj_plot <- DietSeurat(
+  integrated_obj,
+  assays    = DefaultAssay(integrated_obj),
+  counts    = FALSE,   # we only need data slot for FeaturePlot
+  data      = TRUE,
+  scale.data= FALSE,
+  dimreducs = "umap",
+  graphs    = FALSE    # <-- drop graphs to avoid as.Graph() error
+)
+
+# subset safely (no graph conversion now)
+obj_no_uncertain <- subset(obj_plot, cells = keep_cells)
+
+# proceed with the UMAP overlays
+for (feat in score_cols) {
+  p <- FeaturePlot(
+    obj_no_uncertain, features = feat, split.by = "condition",
+    reduction = "umap", order = TRUE, pt.size = 0.3
+  ) + ggtitle(paste0(feat, " (per-cell)"))
+  ggsave(file.path(out_dir, paste0("UMAP_", feat, "_split_by_condition.pdf")),
+         p, width = 12, height = 4.5)
+}
+
+
+# =========================
+# 8) Delta tiles — mean score shifts between conditions, per state
+# =========================
+contrasts <- list(
+  "BP_Control - NS" = c("NS","BP_Control"),
+  "BP_Cues - NS"    = c("NS","BP_Cues"),
+  "BP_Cues - BP_Control" = c("BP_Control","BP_Cues")
+)
+
+delta_long <- lapply(names(contrasts), function(lbl){
+  c1 <- contrasts[[lbl]][1]; c2 <- contrasts[[lbl]][2]
+  sum_long %>%
+    dplyr::filter(condition %in% c(c1,c2)) %>%
+    dplyr::select(state, condition, score, mean) %>%
+    tidyr::pivot_wider(names_from = condition, values_from = mean) %>%
+    dplyr::mutate(delta = .data[[c2]] - .data[[c1]], contrast = lbl)
+}) |> dplyr::bind_rows()
+
+p_delta <- delta_long %>%
+  dplyr::mutate(score = factor(score, levels = score_cols)) %>%
+  ggplot(aes(x = score, y = state, fill = delta)) +
+  geom_tile() +
+  scale_fill_gradient2(low = "#2166AC", mid = "white", high = "#B2182B") +
+  facet_wrap(~ contrast, ncol = 3) +
+  theme_bw() + labs(x = "Hallmark module", y = "Cell state",
+                    fill = "Δ mean\n(score)",
+                    title = "Within-state shifts in module scores (c2 - c1)")
+ggsave(file.path(out_dir, "ModuleScore_delta_tiles_by_state.pdf"),
+       p_delta, width = 12, height = 5.2)
+
+# =========================
+# 9) State rankings (per condition) — lollipop view
+# =========================
+rank_df <- sum_long %>%
+  dplyr::group_by(condition, score) %>%
+  dplyr::arrange(mean, .by_group = TRUE) %>%
+  dplyr::mutate(rank = dplyr::row_number()) %>%
+  dplyr::ungroup()
+
+p_lolli <- rank_df %>%
+  dplyr::mutate(score = factor(score, levels = score_cols)) %>%
+  ggplot(aes(x = mean, y = reorder(state, mean))) +
+  geom_segment(aes(x = 0, xend = mean, yend = reorder(state, mean))) +
+  geom_point(size = 2) +
+  facet_grid(score ~ condition, scales = "free_x") +
+  theme_bw() +
+  labs(x = "Mean module score", y = "State",
+       title = "Which states rank highest within each condition?")
+ggsave(file.path(out_dir, "ModuleScore_state_rank_lollipops.pdf"),
+       p_lolli, width = 12, height = 8)
+
+# =========================
+# 10) EMT vs TNFα–NFκB coupling — by condition
+# =========================
+stopifnot(all(c("EMT_score","TNFA_NFKB_score") %in% score_cols))
+p_scatter <- meta %>%
+  ggplot(aes(x = EMT_score, y = TNFA_NFKB_score, color = state)) +
+  geom_point(alpha = 0.4, size = 0.6) +
+  geom_smooth(method = "lm", se = FALSE) +
+  facet_wrap(~ condition, ncol = length(conds)) +
+  theme_bw() +
+  labs(x = "EMT module score", y = "TNFA–NFκB module score",
+       title = "Coupling of EMT and TNFA–NFκB signals per condition")
+ggsave(file.path(out_dir, "Scatter_EMT_vs_TNFA_by_condition.pdf"),
+       p_scatter, width = 12, height = 4.2)
+
 ```
+
+```{r}
+sum_z <- sum_long %>%
+  group_by(score) %>%
+  mutate(z = scale(mean)) %>%
+  ungroup()
+
+ggplot(sum_z, aes(x = condition, y = z, fill = condition)) +
+  geom_col(position="dodge") +
+  facet_wrap(~state + score, scales="free_y") +
+  labs(y = "z-scored mean module score")
+ggsave(here("output/ModuleScore_zscored_means_by_state_condition.pdf"),
+       width = 12, height = 7)
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tidyr)
+  library(ggplot2)
+  library(ggbeeswarm)   # for better point spreading
+  library(here)
+  library(stringr)
+})
+```
+
+
+```{r}
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tidyr)
+  library(ggplot2)
+  library(ggbeeswarm)
+  library(ggpubr)
+  library(here)
+})
+
+# ------------------------------------------------------------
+# Config
+# ------------------------------------------------------------
+keep_states <- c("MES-like", "OPC-like-1")
+score_cols  <- c("EMT_score", "TNFA_NFKB_score", "APICAL_JUNCTION_score")
+
+cond_cols <- c(
+  NS = "#808080",
+  BP_Control = "#0072B2",
+  BP_Cues = "#D55E00"
+)
+
+use_mean <- TRUE
+central_fun  <- if (use_mean) mean else median
+central_name <- if (use_mean) "mean" else "median"
+
+# ------------------------------------------------------------
+# Prepare data
+# ------------------------------------------------------------
+long_df <- meta %>%
+  filter(state %in% keep_states) %>%
+  pivot_longer(all_of(score_cols), names_to = "Program", values_to = "Score")
+
+long_df$condition <- factor(long_df$condition, levels = names(cond_cols))
+
+# ------------------------------------------------------------
+# Output directory
+# ------------------------------------------------------------
+out_dir <- here("output")
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+file_safe <- function(x) gsub("[^A-Za-z0-9._-]+", "_", x)
+
+# ------------------------------------------------------------
+# Loop for individual plots
+# ------------------------------------------------------------
+for (st in keep_states) {
+  for (pg in score_cols) {
+    df_sub <- long_df %>% filter(state == st, Program == pg)
+
+    # dynamically tighten Y-axis range (adds mild zoom but honest)
+    rng   <- range(df_sub$Score, na.rm = TRUE)
+    span  <- diff(rng)
+    pad   <- 0.15 * span             # 15% padding instead of full range
+    ylims <- c(rng[1] - pad, rng[2] + pad)
+
+    p <- ggplot(df_sub, aes(x = condition, y = Score, fill = condition)) +
+      geom_violin(width = 0.8, trim = TRUE, color = "grey40", alpha = 0.7) +  # slightly wider
+      geom_quasirandom(aes(color = condition),
+                       width = 0.22, size = 0.7, alpha = 0.55, stroke = 0) +
+      stat_summary(
+        fun = central_fun,
+        aes(group = condition),
+        geom = "crossbar",
+        width = 0.3,
+        fatten = 0.6,
+        color = "black",
+        size = 1
+      ) +
+      scale_fill_manual(values = cond_cols) +
+      scale_color_manual(values = cond_cols) +
+      coord_cartesian(ylim = ylims) +  
+      theme_pubr() +
+      theme(
+        axis.text.x = element_text(angle = 45, hjust = 1, size = 11, color = "black"),
+        axis.text.y = element_text(size = 11, color = "black"),
+        axis.title  = element_text(size = 12, color = "black"),
+        panel.grid.major.y = element_line(color = "grey90", size = 0.3),
+        panel.grid.minor.y = element_blank(),
+        panel.grid.major.x = element_blank(),
+        axis.ticks = element_line(color = "black", size = 0.3),
+        strip.text = element_text(size = 11, face = "bold"),
+        legend.position = "none"
+      ) +
+      labs(
+        x = "Condition",
+        y = "Module score",
+        title = paste0(pg, " — ", st),
+        subtitle = paste("Horizontal line =", central_name)
+      )
+
+    outfile <- here(out_dir, paste0("Violin_", file_safe(st), "_", file_safe(pg), ".pdf"))
+    ggsave(outfile, p, width = 6, height = 4, useDingbats = FALSE)
+  }
+}
+
+
+
+```
+
+
+```{r}
+
+```
+
 
 ```{r}
 agg_cond <- AggregateExpression(
@@ -996,7 +1538,7 @@ ggsave("output/Global_PCA_conditions.pdf", width = 6, height = 5)
 
 # Correlation between condition profiles
 pheatmap(cor(mat), main = "Global pseudobulk correlation (conditions)",
-         filename = "output/Global_correlation_conditions.pdf")
+         filename = here("output/Global_correlation_conditions.pdf"))
 ```
 
 
