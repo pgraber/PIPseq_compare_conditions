@@ -42,6 +42,7 @@ library(ComplexHeatmap)
 library(circlize)
 library(fgsea)
 library(msigdbr)
+library(ggpubr)
 
 opts_knit$set(root.dir = here())
 ```
@@ -834,26 +835,40 @@ if (length(res_list)) {
 
 ## GSEA analysis 
 
+```{r}
+
+```
+
 
 ```{r}
-# ---------- GSEA with clusterProfiler (directly from res_list; no flipping) ----------
+# ============================
+# Stand-alone Hallmark GSEA (clusterProfiler) — CSV + DOTPLOT + NES BARPLOT
+# (EMT/APICAL enrichment-curve section removed)
+# Requires: res_list (list of DE data.frames with columns: gene, avg_log2FC[, contrast])
+# ============================
+
 suppressPackageStartupMessages({
   library(dplyr); library(purrr); library(stringr)
   library(clusterProfiler); library(msigdbr)
-  library(ggplot2); library(here); library(readr)
+  library(enrichplot)         # for dotplot()
+  library(ggplot2); library(ggpubr)
+  library(here); library(readr)
 })
 
 set.seed(123)
 
-# 1) MSigDB Hallmark TERM2GENE / TERM2NAME using SYMBOLs
-msig_h_tbl <- msigdbr(species = "Homo sapiens", collection = "H")
-TERM2GENE  <- msig_h_tbl %>% transmute(gs_name, gene_symbol = toupper(trimws(gene_symbol)))
-TERM2NAME  <- msig_h_tbl %>% distinct(gs_name, gs_name) %>% rename(term = gs_name, name = term)
-
+# ---- Helpers ----
 safe_filename <- function(x) gsub("[^A-Za-z0-9._-]+", "_", x)
 
-# 2) Runner for a single contrast data.frame from res_list
-#    Expect columns: gene, avg_log2FC  (from your FindMarkers)
+# ---- Hallmark gene sets ----
+# Use 'category' (correct arg); SYMBOLs already in msigdbr output
+msig_h_tbl <- msigdbr(species = "Homo sapiens", category = "H")
+stopifnot(nrow(msig_h_tbl) > 0)
+
+TERM2GENE <- msig_h_tbl %>%
+  transmute(gs_name, gene_symbol = toupper(trimws(gene_symbol)))
+
+# ---- GSEA runner for a single DE table ----
 run_cp_gsea_on_de <- function(de_df, contrast,
                               TERM2GENE,
                               out_dir = here("output","gsea_cp","conditions_from_cells"),
@@ -861,80 +876,174 @@ run_cp_gsea_on_de <- function(de_df, contrast,
                               pvalueCutoff = 1, pAdjustMethod = "BH") {
   dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
 
-  # Clean & deduplicate genes; keep strongest signal
+  # Clean & prep ranked list
   dd <- de_df %>%
     mutate(gene = toupper(trimws(gene))) %>%
     filter(!is.na(gene), is.finite(avg_log2FC)) %>%
     arrange(desc(abs(avg_log2FC))) %>%
     distinct(gene, .keep_all = TRUE)
 
-  # Build ranked vector: keep DE orientation (avg_log2FC > 0 = up in first term of "c2_vs_c1")
-  geneList <- dd$avg_log2FC
-  names(geneList) <- dd$gene
+  if (!nrow(dd)) {
+    readr::write_lines("# Empty: no genes after cleaning",
+      file.path(out_dir, paste0("GSEA_cp_", safe_filename(contrast), "_Hallmark.csv")))
+    message("No genes after cleaning for ", contrast)
+    return(invisible(NULL))
+  }
+
+  geneList <- dd$avg_log2FC; names(geneList) <- dd$gene
   geneList <- sort(geneList, decreasing = TRUE)
 
-  # clusterProfiler::GSEA with Hallmark (SYMBOL-based)
-  gsea_res <- GSEA(geneList = geneList,
-                   TERM2GENE = TERM2GENE,
-                   pvalueCutoff = pvalueCutoff,
-                   pAdjustMethod = pAdjustMethod,
-                   minGSSize = minGSSize,
-                   maxGSSize = maxGSSize,
-                   verbose = FALSE)
+  # Run GSEA
+  gsea_res <- GSEA(
+    geneList = geneList,
+    TERM2GENE = TERM2GENE,
+    pvalueCutoff = pvalueCutoff,
+    pAdjustMethod = pAdjustMethod,
+    minGSSize = minGSSize,
+    maxGSSize = maxGSSize,
+    verbose = FALSE
+  )
 
-  # Write table (even if empty)
   out_csv <- file.path(out_dir, paste0("GSEA_cp_", safe_filename(contrast), "_Hallmark.csv"))
   if (is.null(gsea_res) || nrow(as.data.frame(gsea_res)) == 0) {
-    write_lines("# Empty: no enriched Hallmark sets", out_csv)
+    readr::write_lines("# Empty: no enriched Hallmark sets", out_csv)
     message("No enriched pathways for ", contrast)
     return(invisible(NULL))
   }
 
   res_df <- as.data.frame(gsea_res) %>% arrange(p.adjust)
-  write_csv(res_df, out_csv)
+  readr::write_csv(res_df, out_csv)
 
-  # Quick plots (optional): top 15 by adjusted p
+  # ---------- NES BARPLOT (Top 15 by FDR, ordered by NES) ----------
+  topN <- 15
+  res_top <- res_df %>%
+    mutate(
+      # clean up names
+      Description = gsub("^HALLMARK_", "", Description),
+      Description = gsub("_", " ", Description),
+      padj = p.adjust
+    ) %>%
+    slice_min(padj, n = topN, with_ties = FALSE)
+
+  # order: positive NES (up) at top, most negative (down) at bottom
+  ord <- res_top %>%
+    arrange(desc(NES)) %>%
+    mutate(Description = factor(Description, levels = rev(Description)))
+
+  p_bar <- ggplot(ord, aes(x = NES, y = Description)) +
+    geom_col(aes(fill = padj), width = 0.7, color = "black", linewidth = 0.1) +
+    geom_vline(xintercept = 0, linetype = "dashed", linewidth = 0.4, color = "grey40") +
+    # smooth blue–white–red scale: red = low FDR (strong), blue = high FDR
+    scale_fill_gradientn(
+      colours = c("#2166ac", "#f7f7f7", "#b2182b"),
+      name = expression(p.adjust),
+      trans = "reverse",
+      guide = guide_colorbar(barwidth = 1.1, barheight = 7)
+    ) +
+    labs(
+      title = paste0("Hallmark GSEA — ", contrast),
+      subtitle = "Upregulated (high NES) at top; downregulated (low NES) at bottom. Color = FDR.",
+      x = "Normalized Enrichment Score (NES)",
+      y = NULL
+    ) +
+    ggpubr::theme_pubr(base_size = 14) +
+    theme(
+      legend.position = "right",
+      plot.title = element_text(face = "bold", size = 15),
+      plot.subtitle = element_text(size = 12),
+      axis.text.y = element_text(size = 11),
+      axis.text.x = element_text(size = 11),
+      legend.text = element_text(size = 11),
+      legend.title = element_text(size = 12)
+    )
+
+  ggsave(file.path(out_dir, paste0("GSEA_cp_barplot_", safe_filename(contrast), ".pdf")),
+         p_bar, width = 8, height = 6, useDingbats = FALSE)
+
+  # ---------- Overview DOTPLOT (top 15) ----------
+  gsea_res@result$Description <- gsub("^HALLMARK_", "", gsea_res@result$Description)
   p_dot <- dotplot(gsea_res, showCategory = 15) +
     ggtitle(paste0("Hallmark GSEA (clusterProfiler) — ", contrast))
   ggsave(file.path(out_dir, paste0("GSEA_cp_dotplot_", safe_filename(contrast), ".pdf")),
-         p_dot, width = 7, height = 5, useDingbats = FALSE)
-
-  # Enrichment plot for top up & down (if present)
-  top_up  <- res_df %>% filter(NES > 0) %>% slice_min(p.adjust, n = 1, with_ties = FALSE)
-  top_dn  <- res_df %>% filter(NES < 0) %>% slice_min(p.adjust, n = 1, with_ties = FALSE)
-
-  plot_one <- function(row) {
-    if (nrow(row) == 0) return(NULL)
-    gs <- row$ID[[1]]
-    p  <- enrichplot::gseaplot2(gsea_res, geneSetID = gs, title = paste0(gs, " (", contrast, ")"))
-    ggsave(file.path(out_dir, paste0("GSEA_cp_enrichment_",
-           safe_filename(gs), "_", safe_filename(contrast), ".pdf")),
-           p, width = 7, height = 5, useDingbats = FALSE)
-  }
-  plot_one(top_up); plot_one(top_dn)
+         p_dot, width = 10, height = 8, useDingbats = FALSE)
 
   invisible(res_df)
 }
 
-# 3) Run across your in-memory DE list
+# ---- Run across your res_list ----
 out_dir_cp <- here("output","gsea_cp","conditions_from_cells")
 dir.create(out_dir_cp, recursive = TRUE, showWarnings = FALSE)
 
-iwalk(res_list, function(de_df, key) {
-  # Prefer explicit contrast column if present (e.g., "BP_Cues_vs_NS")
-  contrast <- if ("contrast" %in% names(de_df)) unique(de_df$contrast)[1] else {
-    parts <- strsplit(key, "\\|")[[1]]           # key was "c1|c2" in your loop
-    paste0(parts[2], "_vs_", parts[1])           # c2_vs_c1
+stopifnot(exists("res_list"), length(res_list) > 0)
+
+purrr::iwalk(res_list, function(de_df, key) {
+  contrast <- if ("contrast" %in% names(de_df)) unique(na.omit(de_df$contrast))[1] else {
+    parts <- strsplit(key, "\\|")[[1]]  # if your key was "c1|c2"
+    if (length(parts) == 2) paste0(parts[2], "_vs_", parts[1]) else as.character(key)
   }
-  message("\n=== clusterProfiler GSEA (no flip): ", contrast, " ===",
-          "\n    Convention: NES>0 = enriched in FIRST term of '", contrast, "' (your c2)")
+  message("\n=== Hallmark GSEA: ", contrast, " ===",
+          "\nNES>0 = enriched in FIRST term of '", contrast, "' (your c2)")
+
   run_cp_gsea_on_de(de_df, contrast, TERM2GENE, out_dir = out_dir_cp,
                     minGSSize = 10, maxGSSize = 500)
 })
 
-message("Done. GSEA (clusterProfiler) outputs in: ", out_dir_cp)
+message("Done. GSEA outputs in: ", out_dir_cp)
+
 
 ```
+
+## Enrich plot for Apical and EMT
+
+```{r}
+suppressPackageStartupMessages({ library(enrichplot); library(ggplot2); library(ggpubr); library(here) })
+
+# Use the SAME gsea_res you just inspected
+stopifnot(exists("gsea_res"))
+
+out_dir <- here("output","gsea_cp","emt_apical_gseaplot2_final")
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+targets <- c("HALLMARK_APICAL_JUNCTION",
+             "HALLMARK_EPITHELIAL_MESENCHYMAL_TRANSITION")
+
+plot_one <- function(gs_id, contrast_label = NULL) {
+  # pull NES/FDR from this gsea_res so labels match
+  df <- as.data.frame(gsea_res)
+  row <- df[df$ID == gs_id, , drop = FALSE]
+  NES_txt <- sprintf("%.2f", row$NES[1])
+  FDR_txt <- formatC(row$p.adjust[1], format = "e", digits = 2)
+
+  title_main <- sub("^HALLMARK_", "", gs_id)
+  subtitle   <- paste0("NES = ", NES_txt, " | FDR = ", FDR_txt,
+                       if (!is.null(contrast_label)) paste0(" | ", contrast_label) else "")
+
+  p <- enrichplot::gseaplot2(
+    gsea_res,
+    geneSetID = gs_id,      # exact ID shown in your object
+    subplots  = 1:3,
+    base_size = 12
+  ) +
+    ggtitle(title_main, subtitle = subtitle) +
+    ggpubr::theme_pubr(base_size = 14) +
+    labs(x = "Ranked genes", y = "Running enrichment score") +
+    geom_hline(yintercept = 0, linetype = "dashed", linewidth = 0.4, color = "grey40")
+
+  fn_stub <- paste0("gseaplot2_", gsub("[^A-Za-z0-9._-]+","_", gs_id),
+                    if (!is.null(contrast_label)) paste0("_", gsub("[^A-Za-z0-9._-]+","_", contrast_label)) else "")
+  ggsave(file.path(out_dir, paste0(fn_stub, ".pdf")), p, width = 8, height = 8, useDingbats = FALSE)
+  ggsave(file.path(out_dir, paste0(fn_stub, ".png")), p, width = 8, height = 8, dpi = 300)
+  message("Saved: ", file.path(out_dir, paste0(fn_stub, ".pdf")))
+}
+
+# If you have a contrast string, pass it; otherwise omit
+contrast_label <- NULL  # e.g., "BP_Cues_vs_BP_Control"
+
+lapply(targets, plot_one, contrast_label = contrast_label)
+
+
+```
+
 
 ```{r}
 
@@ -1102,6 +1211,9 @@ readr::write_csv(nes_tab, file.path(out_dir_ws, "NES_summary_within_state.csv"))
 
 
 ```
+
+
+
 
 ```{r}
 suppressPackageStartupMessages({
@@ -2385,6 +2497,253 @@ if (length(summary_rows)) {
   message("No contrasts were run. Check state names, condition names, and per-condition cell counts (>=10).")
 }
 
+
+
+```
+
+## Leading edge genes
+
+
+```{r}
+suppressPackageStartupMessages({
+  library(dplyr); library(readr); library(stringr); library(purrr); library(tidyr)
+})
+
+# ---- inputs (your uploaded files) ----
+files <- c(
+  here("output/gsea_cp/conditions_from_cells/GSEA_cp_BP_Control_vs_NS_Hallmark.csv"),
+  here("output/gsea_cp/conditions_from_cells/GSEA_cp_BP_Cues_vs_NS_Hallmark.csv"),
+  here("output/gsea_cp/conditions_from_cells/GSEA_cp_BP_Cues_vs_BP_Control_Hallmark.csv")
+)
+
+# helper to read a single GSEA cp csv
+read_gsea_cp <- function(path){
+  df <- suppressWarnings(read_csv(path, show_col_types = FALSE))
+  df$contrast <- gsub("^GSEA_cp_|_Hallmark\\.csv$", "", basename(path))
+  df
+}
+
+gsea_all <- files %>% map_df(read_gsea_cp)
+
+# Keep only Hallmarks of interest
+targets <- c("HALLMARK_EPITHELIAL_MESENCHYMAL_TRANSITION", "HALLMARK_APICAL_JUNCTION")
+gsea_sel <- gsea_all %>%
+  filter(ID %in% targets) %>%
+  # ensure required columns exist and are numeric
+  mutate(NES = as.numeric(NES),
+         p.adjust = as.numeric(p.adjust))
+
+# Extract leading-edge gene list per (ID, contrast)
+# clusterProfiler stores leading edge in 'core_enrichment' separated by '/'
+lead_tbl <- gsea_sel %>%
+  transmute(
+    ID, contrast, NES, p.adjust,
+    weight = abs(NES) * (-log10(p.adjust + 1e-300)),  # robustness to zeros
+    genes = str_split(core_enrichment, "/")
+  ) %>%
+  tidyr::unnest(genes) %>%
+  mutate(genes = toupper(trimws(genes)))
+
+# Rank genes within each pathway by cumulative weight across contrasts
+lead_rank <- lead_tbl %>%
+  group_by(ID, genes) %>%
+  summarise(
+    n_contrasts = n_distinct(contrast),
+    cum_weight  = sum(weight, na.rm = TRUE),
+    best_FDR    = min(p.adjust, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(ID, desc(cum_weight), best_FDR)
+
+# Pick a tidy panel size (edit if you prefer)
+top_emt   <- lead_rank %>% filter(ID == "HALLMARK_EPITHELIAL_MESENCHYMAL_TRANSITION") %>% slice_head(n = 10)
+top_apj   <- lead_rank %>% filter(ID == "HALLMARK_APICAL_JUNCTION") %>% slice_head(n = 8)
+
+panel_genes_upper <- c(top_emt$genes, top_apj$genes) %>% unique()
+
+```
+
+```{r}
+# Map uppercase → object feature names (handles case mismatches)
+obj_genes_upper <- toupper(rownames(integrated_obj))
+map_back <- setNames(rownames(integrated_obj), obj_genes_upper)
+
+panel_genes <- unname(map_back[intersect(panel_genes_upper, names(map_back))])
+panel_genes <- panel_genes[!is.na(panel_genes)]
+
+# Keep EMT first then Apical order for plot
+emt_genes   <- unname(map_back[intersect(top_emt$genes, names(map_back))])
+apj_genes   <- unname(map_back[intersect(top_apj$genes, names(map_back))])
+features_ordered <- c(emt_genes, apj_genes)
+
+# Save the final gene panel (for SI)
+readr::write_csv(
+  tibble::tibble(
+    pathway = c(rep("EMT", length(emt_genes)), rep("Apical_Junction", length(apj_genes))),
+    gene = features_ordered
+  ),
+  "leading_edge_gene_panel.csv"
+)
+
+```
+
+
+```{r}
+suppressPackageStartupMessages({
+  library(ComplexHeatmap); library(circlize); library(grid)
+  library(dplyr); library(tibble); library(here)
+})
+
+# =========================
+# 1) Your leading-edge gene vectors
+# =========================
+le_control_vs_ns <- c("CCN1","ID2","NTM","SPP1","JUN","RHOB","SLIT2","IGFBP2",
+                      "BASP1","TNC","CD59","DST","HTRA1","GJA1","GPC1","MATN2",
+                      "PRRX1","PFN2")
+
+le_cues_vs_ns <- c("CCN1","ID2","JUN","SLIT2","IGFBP2","RHOB","GJA1","NTM",
+                   "TNC","GPC1","HTRA1","TIMP3","LRP1","CD59","DST","SPARC",
+                   "BASP1","CAP2","PFN2","ITGAV","SPP1","MATN2","CDH2","IGFBP4",
+                   "GADD45A","COL11A1","PRRX1","COLGALT1","FSTL1","CALD1","PLOD2",
+                   "SPOCK1","FBN2")
+
+le_cues_vs_control <- c("COLGALT1","COL4A2","EMP3","TPM1","MMP14","LAMC1","LGALS1",
+                        "IGFBP4","NOTCH2","VIM","SPARC","TNFRSF12A","COL4A1","GJA1",
+                        "FLNA","PLOD1","SPOCK1","TIMP1","SGCB","THY1","GAS1","FERMT2",
+                        "LRP1","ENO2","JUN","PLOD3","ELN","ITGAV","PLAUR","GPC1","TIMP3",
+                        "TNFAIP3","IGFBP2","SLIT2","PMP22","IGFBP3")
+
+# =========================
+# 2) Build presence matrix (genes x contrasts)
+# =========================
+all_genes <- sort(unique(c(le_control_vs_ns, le_cues_vs_ns, le_cues_vs_control)))
+mat <- matrix(0L, nrow = length(all_genes), ncol = 3,
+              dimnames = list(all_genes,
+                              c("Bioinert vs\nScaffold-free",
+                                "Biofunctional vs\nScaffold-free",
+                                "Biofunctional vs\nBioinert")))
+mat[rownames(mat) %in% le_control_vs_ns,   1] <- 1L
+mat[rownames(mat) %in% le_cues_vs_ns,      2] <- 1L
+mat[rownames(mat) %in% le_cues_vs_control, 3] <- 1L
+
+# =========================
+# 3) Compute category (Core / Embedding / Cue)
+# =========================
+bn <- mat[,1] == 1
+cn <- mat[,2] == 1
+cb <- mat[,3] == 1
+
+row_category <- ifelse(bn & cn & cb, "Core",
+                  ifelse((bn | cn) & !cb, "Embedding-shared", "Cue-specific"))
+
+row_split <- factor(row_category, levels=c("Core","Embedding-shared","Cue-specific"))
+
+# order rows
+ord <- order(row_split, -rowSums(mat), rownames(mat))
+mat <- mat[ord, , drop=FALSE]
+row_split <- droplevels(row_split[ord])
+
+# =========================
+# 4) Aesthetic settings (your preferences)
+# =========================
+
+# Deep blue palette (the nicer one)
+bin_col <- c("0"="#ECEFF1", "1"="#1F4E79")   # light grey → deep blue
+
+# Category colours
+cat_col <- c(Core="#2E7D32", "Embedding-shared"="#FB8C00", "Cue-specific"="#C62828")
+
+left_anno <- rowAnnotation(
+  Category=row_split,
+  col=list(Category=cat_col),
+  annotation_legend_param=list(title="Category", nrow=3)
+)
+
+# =========================
+# MAIN HEATMAP WITH THICKER BORDERS
+# =========================
+ht <- Heatmap(
+  mat,
+  name="Leading-edge",
+  col=bin_col,
+  cluster_rows=FALSE,
+  cluster_columns=FALSE,
+  row_split=row_split,
+  row_gap=unit(4,"mm"),                     # larger gap to separate categories
+  show_row_names=TRUE,
+  row_names_gp=gpar(fontsize=8),
+  show_column_names=TRUE,
+  column_names_rot=0,
+  column_names_gp=gpar(fontsize=10,fontface="bold"),
+  left_annotation=left_anno,
+  
+  cell_fun = function(j, i, x, y, width, height, fill) {
+  grid.rect(x, y, width, height, gp = gpar(col = "black", lwd = 0.7, fill = NA))
+}
+
+  
+  # thicker borders between cells
+  border=FALSE,
+  border_gp=gpar(col="black", lwd=0.1),       # thicker cell grid lines
+  
+  # nicer legend
+  heatmap_legend_param=list(
+    at=c(0,1),
+    labels=c("Not present","Present"),
+    legend_direction="horizontal",
+    nrow=1,
+    title=NULL
+  ),
+  
+  na_col="#D9D9D9"
+)
+
+# =========================
+# 5) Add thicker borders around category blocks
+# =========================
+ht <- draw(ht, padding=unit(c(6,6,6,6),"mm"))
+
+# decorate each row-split region with a subtle outer border
+decorate_heatmap_body("Leading-edge", {
+  # Get height/width
+  nr <- nrow(mat)
+  nc <- ncol(mat)
+  
+  # draw category block outlines
+  split_vec <- row_split
+  idx <- which(diff(as.integer(split_vec))!=0)   # boundaries
+  block_positions <- c(0, idx, nr)
+  
+  for (i in seq_along(block_positions)[-1]) {
+    top <- (block_positions[i-1])/nr
+    bottom <- (block_positions[i])/nr
+    grid.rect(
+      x=0.5, y=top + (bottom-top)/2,
+      width=1, height=(bottom-top),
+      gp=gpar(fill=NA, col="#444444", lwd=1.5)    # thicker border for category block
+    )
+  }
+})
+
+# =========================
+# 6) Save output
+# =========================
+out_dir <- here::here("output"); if (!dir.exists(out_dir)) dir.create(out_dir,TRUE)
+
+# auto height
+n <- nrow(mat)
+pdf_h <- max(6, min(18, 6 + 0.16*(n/10)))
+png_h <- max(1500, min(6000, round(900 + 18*n)))
+
+pdf(file.path(out_dir,"LeadingEdge_genes_heatmap_nice.pdf"),
+    width=7.2, height=pdf_h, useDingbats=FALSE)
+draw(ht)
+dev.off()
+
+png(file.path(out_dir,"LeadingEdge_genes_heatmap_nice.png"),
+    width=2300, height=png_h, res=300)
+draw(ht)
+dev.off()
 
 
 ```
