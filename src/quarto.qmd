@@ -2595,155 +2595,181 @@ suppressPackageStartupMessages({
 })
 
 # =========================
-# 1) Your leading-edge gene vectors
+# 1) Leading-edge gene vectors (edit here if needed)
 # =========================
-le_control_vs_ns <- c("CCN1","ID2","NTM","SPP1","JUN","RHOB","SLIT2","IGFBP2",
-                      "BASP1","TNC","CD59","DST","HTRA1","GJA1","GPC1","MATN2",
-                      "PRRX1","PFN2")
+le_control_vs_ns <- c(
+  "CCN1","ID2","NTM","SPP1","JUN","RHOB","SLIT2","IGFBP2",
+  "BASP1","TNC","CD59","DST","HTRA1","GJA1","GPC1","MATN2",
+  "PRRX1","PFN2"
+)
 
-le_cues_vs_ns <- c("CCN1","ID2","JUN","SLIT2","IGFBP2","RHOB","GJA1","NTM",
-                   "TNC","GPC1","HTRA1","TIMP3","LRP1","CD59","DST","SPARC",
-                   "BASP1","CAP2","PFN2","ITGAV","SPP1","MATN2","CDH2","IGFBP4",
-                   "GADD45A","COL11A1","PRRX1","COLGALT1","FSTL1","CALD1","PLOD2",
-                   "SPOCK1","FBN2")
+le_cues_vs_ns <- c(
+  "CCN1","ID2","JUN","SLIT2","IGFBP2","RHOB","GJA1","NTM",
+  "TNC","GPC1","HTRA1","TIMP3","LRP1","CD59","DST","SPARC",
+  "BASP1","CAP2","PFN2","ITGAV","SPP1","MATN2","CDH2","IGFBP4",
+  "GADD45A","COL11A1","PRRX1","COLGALT1","FSTL1","CALD1","PLOD2",
+  "SPOCK1","FBN2"
+)
 
-le_cues_vs_control <- c("COLGALT1","COL4A2","EMP3","TPM1","MMP14","LAMC1","LGALS1",
-                        "IGFBP4","NOTCH2","VIM","SPARC","TNFRSF12A","COL4A1","GJA1",
-                        "FLNA","PLOD1","SPOCK1","TIMP1","SGCB","THY1","GAS1","FERMT2",
-                        "LRP1","ENO2","JUN","PLOD3","ELN","ITGAV","PLAUR","GPC1","TIMP3",
-                        "TNFAIP3","IGFBP2","SLIT2","PMP22","IGFBP3")
+le_cues_vs_control <- c(
+  "COLGALT1","COL4A2","EMP3","TPM1","MMP14","LAMC1","LGALS1",
+  "IGFBP4","NOTCH2","VIM","SPARC","TNFRSF12A","COL4A1","GJA1",
+  "FLNA","PLOD1","SPOCK1","TIMP1","SGCB","THY1","GAS1","FERMT2",
+  "LRP1","ENO2","JUN","PLOD3","ELN","ITGAV","PLAUR","GPC1","TIMP3",
+  "TNFAIP3","IGFBP2","SLIT2","PMP22","IGFBP3"
+)
 
 # =========================
-# 2) Build presence matrix (genes x contrasts)
+# 2) Presence matrix (genes x contrasts)
 # =========================
 all_genes <- sort(unique(c(le_control_vs_ns, le_cues_vs_ns, le_cues_vs_control)))
-mat <- matrix(0L, nrow = length(all_genes), ncol = 3,
-              dimnames = list(all_genes,
-                              c("Bioinert vs\nScaffold-free",
-                                "Biofunctional vs\nScaffold-free",
-                                "Biofunctional vs\nBioinert")))
+
+mat <- matrix(
+  0L, nrow = length(all_genes), ncol = 3,
+  dimnames = list(
+    all_genes,
+    c("Bioinert vs\nScaffold-free",
+      "Biofunctional vs\nScaffold-free",
+      "Biofunctional vs\nBioinert")
+  )
+)
+
 mat[rownames(mat) %in% le_control_vs_ns,   1] <- 1L
 mat[rownames(mat) %in% le_cues_vs_ns,      2] <- 1L
 mat[rownames(mat) %in% le_cues_vs_control, 3] <- 1L
 
 # =========================
-# 3) Compute category (Core / Embedding / Cue)
+# 3) Categories (Core / Embedding-shared / Cue-specific)
+#    Current definition:
+#    - Core: present in all three contrasts
+#    - Embedding-shared: present in BN and/or CN, but NOT in CB
+#    - Cue-specific: any presence in CB (with or without BN/CN)
+#    If you want Cue-specific == ONLY CB, see the commented variant below.
 # =========================
-bn <- mat[,1] == 1
-cn <- mat[,2] == 1
-cb <- mat[,3] == 1
+bn <- mat[, 1] == 1
+cn <- mat[, 2] == 1
+cb <- mat[, 3] == 1
 
 row_category <- ifelse(bn & cn & cb, "Core",
                   ifelse((bn | cn) & !cb, "Embedding-shared", "Cue-specific"))
 
-row_split <- factor(row_category, levels=c("Core","Embedding-shared","Cue-specific"))
+# ---- Variant (ONLY CB counts as Cue-specific) ----
+# row_category <- ifelse(bn & cn & cb, "Core",
+#                   ifelse((bn | cn) & !cb, "Embedding-shared",
+#                   ifelse(cb & !(bn | cn), "Cue-specific", "Other")))
 
-# order rows
+row_split <- factor(row_category, levels = c("Core","Embedding-shared","Cue-specific"))
+
+# Order rows by group, then by number of contrasts present, then alphabetically
 ord <- order(row_split, -rowSums(mat), rownames(mat))
-mat <- mat[ord, , drop=FALSE]
+mat <- mat[ord, , drop = FALSE]
 row_split <- droplevels(row_split[ord])
 
 # =========================
-# 4) Aesthetic settings (your preferences)
+# 4) Aesthetics
 # =========================
+# Binary colors (0/1)
+bin_col <- c("0" = "#ECEFF1", "1" = "#1F4E79")  # light grey → deep blue
 
-# Deep blue palette (the nicer one)
-bin_col <- c("0"="#ECEFF1", "1"="#1F4E79")   # light grey → deep blue
-
-# Category colours
-cat_col <- c(Core="#2E7D32", "Embedding-shared"="#FB8C00", "Cue-specific"="#C62828")
+# Category colors
+cat_col <- c(Core = "#2E7D32", "Embedding-shared" = "#FB8C00", "Cue-specific" = "#C62828")
 
 left_anno <- rowAnnotation(
-  Category=row_split,
-  col=list(Category=cat_col),
-  annotation_legend_param=list(title="Category", nrow=3)
+  Category = row_split,
+  col = list(Category = cat_col),
+  annotation_legend_param = list(title = "Category", nrow = 3)
 )
 
+# Auto figure heights
+n <- nrow(mat)
+pdf_h <- max(6, min(18, 6 + 0.016 * n))     # gentle scaling with row count
+png_h <- max(1000, min(6000, round(600 + 14 * n)))  # pixels
+
 # =========================
-# MAIN HEATMAP WITH THICKER BORDERS
+# 5) Heatmap object
 # =========================
 ht <- Heatmap(
   mat,
-  name="Leading-edge",
-  col=bin_col,
-  cluster_rows=FALSE,
-  cluster_columns=FALSE,
-  row_split=row_split,
-  row_gap=unit(4,"mm"),                     # larger gap to separate categories
-  show_row_names=TRUE,
-  row_names_gp=gpar(fontsize=8),
-  show_column_names=TRUE,
-  column_names_rot=0,
-  column_names_gp=gpar(fontsize=10,fontface="bold"),
-  left_annotation=left_anno,
-  
-  cell_fun = function(j, i, x, y, width, height, fill) {
-  grid.rect(x, y, width, height, gp = gpar(col = "black", lwd = 0.7, fill = NA))
-}
+  name = "Leading-edge",
+  col = bin_col,
+  cluster_rows = FALSE,
+  cluster_columns = FALSE,
+  row_split = row_split,
+  row_gap = unit(2, "mm"),
+  show_row_names = TRUE,
+  row_names_gp = gpar(fontsize = 8),
+  show_column_names = TRUE,
+  column_names_rot = 0,
+  column_names_gp = gpar(fontsize = 10, fontface = "bold"),
+  left_annotation = left_anno,
 
-  
-  # thicker borders between cells
-  border=FALSE,
-  border_gp=gpar(col="black", lwd=0.1),       # thicker cell grid lines
-  
-  # nicer legend
-  heatmap_legend_param=list(
-    at=c(0,1),
-    labels=c("Not present","Present"),
-    legend_direction="horizontal",
-    nrow=1,
-    title=NULL
+  # per-cell thin borders
+  cell_fun = function(j, i, x, y, width, height, fill) {
+    grid.rect(x, y, width, height, gp = gpar(col = "black", lwd = 0.7, fill = NA))
+  },
+
+  border = FALSE,  # outer heatmap border off
+
+  heatmap_legend_param = list(
+    at = c(0, 1),
+    labels = c("Not present", "Present"),
+    legend_direction = "horizontal",
+    nrow = 1,
+    title = NULL
   ),
-  
-  na_col="#D9D9D9"
+  na_col = "#D9D9D9"
 )
 
 # =========================
-# 5) Add thicker borders around category blocks
+# 6) Save helper (draw + decorate per device)
 # =========================
-ht <- draw(ht, padding=unit(c(6,6,6,6),"mm"))
-
-# decorate each row-split region with a subtle outer border
-decorate_heatmap_body("Leading-edge", {
-  # Get height/width
-  nr <- nrow(mat)
-  nc <- ncol(mat)
-  
-  # draw category block outlines
-  split_vec <- row_split
-  idx <- which(diff(as.integer(split_vec))!=0)   # boundaries
-  block_positions <- c(0, idx, nr)
-  
-  for (i in seq_along(block_positions)[-1]) {
-    top <- (block_positions[i-1])/nr
-    bottom <- (block_positions[i])/nr
-    grid.rect(
-      x=0.5, y=top + (bottom-top)/2,
-      width=1, height=(bottom-top),
-      gp=gpar(fill=NA, col="#444444", lwd=1.5)    # thicker border for category block
-    )
+save_ht <- function(filename, type = c("pdf","png")) {
+  type <- match.arg(type)
+  if (type == "pdf") {
+    pdf(filename, width = 7.2, height = pdf_h, useDingbats = FALSE)
+  } else {
+    png(filename, width = 2300, height = png_h, res = 300)
   }
-})
+
+  ht_drawn <- draw(ht, padding = unit(c(6, 6, 6, 6), "mm"))
+
+  decorate_heatmap_body("Leading-edge", {
+    nr <- nrow(mat)
+    split_vec <- row_split
+    idx <- which(diff(as.integer(split_vec)) != 0)
+    block_positions <- c(0, idx, nr)
+    for (k in seq_len(length(block_positions) - 1)) {
+      top <- (block_positions[k]) / nr
+      bottom <- (block_positions[k + 1]) / nr
+      grid.rect(
+        x = 0.5, y = top + (bottom - top) / 2,
+        width = 1, height = (bottom - top),
+        gp = gpar(fill = NA, col = "#444444", lwd = 1.5)
+      )
+    }
+  })
+
+  dev.off()
+}
 
 # =========================
-# 6) Save output
+# 7) Write outputs
 # =========================
-out_dir <- here::here("output"); if (!dir.exists(out_dir)) dir.create(out_dir,TRUE)
+out_dir <- here("output"); if (!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE)
 
-# auto height
-n <- nrow(mat)
-pdf_h <- max(6, min(18, 6 + 0.16*(n/10)))
-png_h <- max(1500, min(6000, round(900 + 18*n)))
+# Save matrix and categories as TSVs (useful for SI / methods)
+write.table(as.data.frame(mat), file = file.path(out_dir, "LeadingEdge_presence_matrix.tsv"),
+            sep = "\t", quote = FALSE, col.names = NA)
+write.table(
+  tibble(Gene = rownames(mat), Category = as.character(row_split)),
+  file = file.path(out_dir, "LeadingEdge_gene_categories.tsv"),
+  sep = "\t", quote = FALSE, row.names = FALSE
+)
 
-pdf(file.path(out_dir,"LeadingEdge_genes_heatmap_nice.pdf"),
-    width=7.2, height=pdf_h, useDingbats=FALSE)
-draw(ht)
-dev.off()
+# Save figures
+save_ht(file.path(out_dir, "LeadingEdge_genes_heatmap_nice.pdf"), type = "pdf")
+save_ht(file.path(out_dir, "LeadingEdge_genes_heatmap_nice.png"), type = "png")
 
-png(file.path(out_dir,"LeadingEdge_genes_heatmap_nice.png"),
-    width=2300, height=png_h, res=300)
-draw(ht)
-dev.off()
 
 
 ```
