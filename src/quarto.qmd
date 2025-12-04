@@ -555,13 +555,28 @@ integrated_obj <- CellCycleScoring(
   set.ident    = FALSE
 )
 
+# Make sure Phase is an ordered factor
+integrated_obj$Phase <- factor(integrated_obj$Phase,
+                               levels = c("G1", "G2M", "S"))
+
 phase_dim_plot <- DimPlot(integrated_obj, group.by = "Phase") +
   ggtitle("Cell cycle phase across all cells") +
-  scale_color_manual(values = c(
-    G1  = "#999999",
-    S   = "#56B4E9",
-    G2M = "#E69F00"
-  ))
+  scale_color_manual(
+    values = c(
+      G1  = "#999999",
+      G2M = "#E69F00",
+      S   = "#56B4E9"
+    ),
+    breaks = c("G1", "G2M", "S")
+  ) +
+  theme(
+    plot.title   = element_text(face = "bold", size = 16),
+    axis.title   = element_text(face = "bold", size = 14),
+    axis.text    = element_text(size = 13),
+    legend.title = element_text(face = "bold", size = 12),
+    legend.text  = element_text(size = 11)
+  )
+
 
 FeaturePlot(integrated_obj, features = c("S.Score", "G2M.Score"))
 
@@ -570,31 +585,53 @@ phase_counts <- prop.table(table(integrated_obj$Phase, integrated_obj$condition)
   as.data.frame() %>%
   dplyr::rename(Phase = Var1, Condition = Var2, Proportion = Freq) %>%
   mutate(
+    Phase     = factor(Phase, levels = c("G1", "G2M", "S")),  # enforce order again
     Condition = factor(Condition, levels = c("NS", "BP_Control", "BP_Cueswha")),
-    label = sprintf("%.1f%%", Proportion * 100)   # format labels
+    label     = sprintf("%.1f%%", Proportion * 100)
   )
 
 # Barplot with percentage labels inside bars
 phase_barplot <- ggplot(phase_counts, aes(x = Condition, y = Proportion, fill = Phase)) +
-  geom_bar(stat = "identity", position = "fill", color = "black") +
-  geom_text(aes(label = label),
-            position = position_stack(vjust = 0.5),  # centers labels within stacks
-            color = "white", size = 4, fontface = "bold") +
-  scale_fill_manual(values = c(G1="#999999", S="#56B4E9", G2M="#E69F00")) +
+  geom_bar(
+    stat = "identity",
+    position = position_fill(reverse = TRUE),
+    color = "black"
+  ) +
+  geom_text(
+    aes(label = label),
+    position = position_stack(vjust = 0.5, reverse = TRUE),
+    color = "white",
+    size = 4,
+    fontface = "bold"
+  ) +
+  scale_fill_manual(
+    values = c(G1="#999999", G2M="#E69F00", S="#56B4E9"),
+    breaks = c("G1", "G2M", "S")
+  ) +
+  guides(fill = guide_legend(reverse = FALSE)) +
   scale_y_continuous(labels = scales::percent_format()) +
   labs(
     title = "Cell-cycle composition across conditions",
-    x = NULL, y = "Fraction of cells", fill = "Phase"
+    x = NULL,
+    y = "Fraction of cells",
+    fill = "Phase"
   ) +
   theme_pubr() +
   theme(
-    plot.title = element_text(face = "bold", size = 14),
-    axis.text = element_text(size = 11),
+    plot.title      = element_text(face = "bold", size = 16),  # ↑ title size
+    axis.title.y    = element_text(size = 14, face = "bold"),   # ↑ Y axis title
+    axis.text.x     = element_text(size = 13, angle = 0),       # ↑ X tick labels
+    axis.text.y     = element_text(size = 13),                  # ↑ Y tick labels
+    legend.title    = element_text(size = 12, face = "bold"),
+    legend.text     = element_text(size = 11),
     legend.position = "right"
   )
 
+
 ggsave(phase_dim_plot, filename = here("output/cell_cycle_phase_umap.pdf"), width = 8, height = 6)
 ggsave(phase_barplot, filename = here("output/cell_cycle_phase_barplot.pdf"), width = 8, height = 6)
+
+
 ```
 
 ```{r}
@@ -923,42 +960,57 @@ run_cp_gsea_on_de <- function(de_df, contrast,
       Description = gsub("_", " ", Description),
       padj = p.adjust
     ) %>%
+    filter(padj <= 0.05) %>%
     slice_min(padj, n = topN, with_ties = FALSE)
 
   # order: positive NES (up) at top, most negative (down) at bottom
+    # Order by NES and create sign variable
   ord <- res_top %>%
     arrange(desc(NES)) %>%
-    mutate(Description = factor(Description, levels = rev(Description)))
+    mutate(
+      Description = factor(Description, levels = rev(Description)),
+      NES_sign = ifelse(NES >= 0, "Positive", "Negative")
+    )
 
+  # Symmetric x-axis limits
+  max_abs_NES <- max(abs(ord$NES), na.rm = TRUE)
+  x_lim <- c(-max_abs_NES, max_abs_NES)
+
+  # old plot version (kept for reference)
+  # p_bar <- ggplot(ord, aes(x = NES, y = Description)) +
+  #   geom_col(aes(fill = padj), width = 0.7, color = "black", linewidth = 0.1) +
+  #   geom_vline(xintercept = 0, linetype = "dashed", linewidth = 0.4, color = "grey40") +
+  #   scale_fill_gradientn(colours = c("#2166ac", "#f7f7f7", "#b2182b"),
+  #                        name = expression(p.adjust),
+  #                        trans = "reverse",
+  #                        guide = guide_colorbar(barwidth = 1.1, barheight = 7)) +
+  #   labs(subtitle = "Upregulated (high NES) at top; downregulated (low NES) at bottom. Color = FDR.")
+
+  # new sign-based colour version
   p_bar <- ggplot(ord, aes(x = NES, y = Description)) +
-    geom_col(aes(fill = padj), width = 0.7, color = "black", linewidth = 0.1) +
+    geom_col(aes(fill = NES_sign), width = 0.7, color = "black", linewidth = 0.1) +
     geom_vline(xintercept = 0, linetype = "dashed", linewidth = 0.4, color = "grey40") +
-    # smooth blue–white–red scale: red = low FDR (strong), blue = high FDR
-    scale_fill_gradientn(
-      colours = c("#2166ac", "#f7f7f7", "#b2182b"),
-      name = expression(p.adjust),
-      trans = "reverse",
-      guide = guide_colorbar(barwidth = 1.1, barheight = 7)
-    ) +
+    scale_fill_manual(values = c("Positive" = "#b2182b", "Negative" = "#2166ac"),
+                      name = NULL) +
+    scale_x_continuous(limits = x_lim) +
     labs(
       title = paste0("Hallmark GSEA — ", contrast),
-      subtitle = "Upregulated (high NES) at top; downregulated (low NES) at bottom. Color = FDR.",
+      subtitle = "Positive NES = enriched in first condition; Negative NES = enriched in second.",
       x = "Normalized Enrichment Score (NES)",
       y = NULL
     ) +
     ggpubr::theme_pubr(base_size = 14) +
     theme(
-      legend.position = "right",
+      legend.position = "none",
       plot.title = element_text(face = "bold", size = 15),
       plot.subtitle = element_text(size = 12),
       axis.text.y = element_text(size = 11),
-      axis.text.x = element_text(size = 11),
-      legend.text = element_text(size = 11),
-      legend.title = element_text(size = 12)
+      axis.text.x = element_text(size = 11)
     )
 
   ggsave(file.path(out_dir, paste0("GSEA_cp_barplot_", safe_filename(contrast), ".pdf")),
          p_bar, width = 8, height = 6, useDingbats = FALSE)
+
 
   # ---------- Overview DOTPLOT (top 15) ----------
   gsea_res@result$Description <- gsub("^HALLMARK_", "", gsea_res@result$Description)
@@ -1050,12 +1102,22 @@ lapply(targets, plot_one, contrast_label = contrast_label)
 out_dir_cp <- here("output","gsea_cp","conditions_from_cells")
 files <- list.files(out_dir_cp, pattern = "^GSEA_cp_.*_Hallmark\\.csv$", full.names = TRUE)
 
-top_by_contrast <- lapply(files, function(f){
+top_by_contrast <- lapply(files, function(f) {
   df <- suppressWarnings(read_csv(f, show_col_types = FALSE))
   if (!nrow(df)) return(NULL)
-  df <- df %>% arrange(p.adjust) %>% mutate(contrast = sub("^GSEA_cp_|_Hallmark\\.csv$", "", basename(f)))
-  df %>% dplyr::select(contrast, ID, NES, p.adjust) %>% head(10)
+
+  df %>%
+    mutate(contrast = sub("^GSEA_cp_|_Hallmark\\.csv$", "", basename(f))) %>%
+
+    filter(p.adjust <= 0.05) %>%
+
+    arrange(desc(abs(NES))) %>%
+
+    dplyr::select(contrast, ID, NES, p.adjust) %>%
+
+    head(10)
 })
+
 top_by_contrast <- bind_rows(top_by_contrast)
 print(top_by_contrast, n = 30)
 
